@@ -5505,6 +5505,7 @@ PORTAL_COMMANDS: list[tuple[str, str, str]] = [
     ("last", "last", "Re-print last output."),
     ("info", "info [user]", "One-line user summary."),
     ("settings", "settings", "Show current settings."),
+    ("config", "config [view|set|reset|llm|display|filters|system]", "View/set grouped configuration."),
     ("set", "set <key> <val>", "Set config (top, llm_url, ...)."),
     ("alias", "alias [<name>=<cmd>]", "Define/list/remove aliases."),
     ("ignore", "ignore [add|drop|list]", "Manage ignore list."),
@@ -5818,7 +5819,7 @@ function renderMenu(data){
             'forensic':['entities','gaps','reconstruct','forensic_report','timeline_narrative','evidence'],
             'llm':['analyze','ask','askall','interact','compare','compare-auto','tag','tagall','explain','summarize','cluster','auto_report','drift-explain','llm_search','llm_threat','llm_bot','llm_profile','llm_insider','llm_social','llm_incident','llm_topics','llm_sessions','llm_baseline','llm_summary','llm_replay','llm_predict','llm_motive','llm_relationship','llm_audit','llm_risk'],
             'multi':['multi','aggregate','export_html','export_html_drilldown','export_sql','sql','save_profile','load_profile','compare_profiles'],
-            'config':['settings','set','alias','note','load','reload','save_config','load_config','rules','web','webportal','webhook'],
+            'config':['config','settings','set','alias','note','load','reload','save_config','load_config','rules','web','webportal','webhook'],
             'system':['commands','help','quit','script','export','cron','dashboard','watch','watch_alert','alert_fatigue']};
   var catLabel={'nav':'navigation','analysis':'analysis','viewing':'viewing','filters':'filters','interaction':'interaction','forensic':'forensic','llm':'llm','multi':'multi-log / export','config':'config','system':'system'};
   var done={};
@@ -7318,6 +7319,190 @@ class LogShell(cmd.Cmd):
             print(f"  webportal       = (off)")
         print(f"  back/fwd        = {len(st.focus_back)}/{len(st.focus_forward)}")
 
+    def do_config(self, arg: str) -> None:
+        """config [view|set|reset|llm|display|filters|system]   View/set configuration.
+
+        Sub-commands:
+          config            Show all config grouped by category
+          config view       Same as above
+          config set KEY VAL  Set a config key (same keys as 'set')
+          config reset KEY  Reset a config key to its default
+          config llm        Show LLM-related settings
+          config display    Show display settings (pager, color)
+          config filters    Show active filters (focus, target, since, until)
+          config system     Show system info (entries, servers, webhooks)
+        """
+        parts = self._split(arg)
+        if not parts or parts[0] in ("view", ""):
+            self._config_view()
+        elif parts[0] == "set":
+            if len(parts) < 3:
+                print("Usage: config set <key> <value>")
+                print("Keys: top, llm_url, llm_model, max_chunk_chars, llm_cache, pager, color, webhook_url, webhook_type, plugin_dir")
+                return
+            self.do_set(f"{parts[1]} {' '.join(parts[2:])}")
+        elif parts[0] == "reset":
+            if len(parts) < 2:
+                print("Usage: config reset <key>")
+                print("Resets a key to its default value.")
+                return
+            self._config_reset(parts[1])
+        elif parts[0] == "llm":
+            self._config_llm()
+        elif parts[0] == "display":
+            self._config_display()
+        elif parts[0] == "filters":
+            self._config_filters()
+        elif parts[0] == "system":
+            self._config_system()
+        else:
+            print(f"Unknown sub-command: {parts[0]}")
+            print("Use: config [view|set|reset|llm|display|filters|system]")
+
+    def _config_view(self) -> None:
+        st = self.state
+        print("=== LLM ===")
+        print(f"  llm_url         = {st.llm_url}")
+        print(f"  llm_model       = {st.llm_model}")
+        print(f"  max_chunk_chars = {st.max_chunk_chars}")
+        if st.llm_cache:
+            print(f"  llm_cache       = {st.llm_cache.path}  ({len(st.llm_cache)} entries)")
+        else:
+            print(f"  llm_cache       = (off)")
+        print()
+        print("=== Display ===")
+        print(f"  pager           = {st.pager_enabled}")
+        print(f"  color           = {st.color_enabled}")
+        print(f"  top             = {st.top_n}")
+        print()
+        print("=== Filters ===")
+        print(f"  focused_user    = {st.focused_user or '(none)'}")
+        print(f"  focused_target  = {st.focused_target or '(none)'}")
+        print(f"  since           = {st.since or '(none)'}")
+        print(f"  until           = {st.until or '(none)'}")
+        if st.ignore_set:
+            print(f"  ignored         = {len(st.ignore_set)} users")
+        if st.views:
+            print(f"  views           = {', '.join(st.views)}")
+        print()
+        print("=== System ===")
+        print(f"  log_path        = {st.log_path}")
+        print(f"  entries         = {len(st.entries)}  active = {len(self._active_entries())}")
+        if st.web_server:
+            print(f"  web_server      = running (:{st.web_server.server_port})")
+        if st.portal_server:
+            print(f"  webportal       = running (:{st.portal_server.server_port})")
+        else:
+            print(f"  webportal       = (off)")
+        print(f"  webhook_url     = {st.webhook_url or '(not set)'}")
+        print(f"  webhook_type    = {st.webhook_type}")
+        print(f"  plugin_dir      = {st.plugin_dir or '(not set)'}")
+        print(f"  rules           = {len(st.alert_engine.rules)} alert rules")
+        print(f"  multi_sources   = {len(st.multi_log_sources)} sources")
+        if st.aliases:
+            print(f"  aliases         = {len(st.aliases)} ({', '.join(list(st.aliases)[:5])}{'...' if len(st.aliases) > 5 else ''})")
+        if st.notes:
+            print(f"  notes           = {len(st.notes)} users")
+        if st.watch_bg:
+            print(f"  watch_bg        = running (+{st.watch_bg.new_count} new)")
+        print(f"  back/fwd        = {len(st.focus_back)}/{len(st.focus_forward)}")
+
+    def _config_llm(self) -> None:
+        st = self.state
+        print("=== LLM Configuration ===")
+        print(f"  llm_url         = {st.llm_url}")
+        print(f"  llm_model       = {st.llm_model}")
+        print(f"  max_chunk_chars = {st.max_chunk_chars}")
+        if st.llm_cache:
+            print(f"  llm_cache       = {st.llm_cache.path}  ({len(st.llm_cache)} entries)")
+        else:
+            print(f"  llm_cache       = (off)")
+
+    def _config_display(self) -> None:
+        st = self.state
+        print("=== Display Configuration ===")
+        print(f"  pager           = {st.pager_enabled}")
+        print(f"  color           = {st.color_enabled}")
+        print(f"  top             = {st.top_n}")
+
+    def _config_filters(self) -> None:
+        st = self.state
+        print("=== Active Filters ===")
+        print(f"  focused_user    = {st.focused_user or '(none)'}")
+        print(f"  focused_target  = {st.focused_target or '(none)'}")
+        print(f"  since           = {st.since or '(none)'}")
+        print(f"  until           = {st.until or '(none)'}")
+        if st.ignore_set:
+            print(f"  ignored         = {len(st.ignore_set)} users: {', '.join(sorted(st.ignore_set)[:10])}{'...' if len(st.ignore_set) > 10 else ''}")
+        if st.views:
+            print(f"  views           = {', '.join(st.views)}")
+        active = self._active_entries()
+        print(f"  active entries  = {len(active)} / {len(st.entries)} total")
+
+    def _config_system(self) -> None:
+        st = self.state
+        print("=== System ===")
+        print(f"  log_path        = {st.log_path}")
+        print(f"  entries         = {len(st.entries)}  active = {len(self._active_entries())}")
+        if st.web_server:
+            print(f"  web_server      = running (:{st.web_server.server_port})")
+        if st.portal_server:
+            print(f"  webportal       = running (:{st.portal_server.server_port})")
+        else:
+            print(f"  webportal       = (off)")
+        print(f"  webhook_url     = {st.webhook_url or '(not set)'}")
+        print(f"  webhook_type    = {st.webhook_type}")
+        print(f"  plugin_dir      = {st.plugin_dir or '(not set)'}")
+        print(f"  rules           = {len(st.alert_engine.rules)} alert rules")
+        print(f"  multi_sources   = {len(st.multi_log_sources)} sources")
+        if st.aliases:
+            print(f"  aliases         = {len(st.aliases)} ({', '.join(list(st.aliases)[:5])}{'...' if len(st.aliases) > 5 else ''})")
+        if st.notes:
+            print(f"  notes           = {len(st.notes)} users")
+        if st.watch_bg:
+            print(f"  watch_bg        = running (+{st.watch_bg.new_count} new)")
+        print(f"  back/fwd        = {len(st.focus_back)}/{len(st.focus_forward)}")
+
+    CONFIG_DEFAULTS: dict[str, object] = {
+        "top": 15,
+        "top_n": 15,
+        "llm_url": "http://127.0.0.1:8033/",
+        "llm_model": "local",
+        "max_chunk_chars": 12000,
+        "llm_cache": None,
+        "pager": True,
+        "pager_enabled": True,
+        "color": True,
+        "color_enabled": True,
+        "webhook_url": "",
+        "webhook_type": "slack",
+        "plugin_dir": "",
+    }
+
+    def _config_reset(self, key: str) -> None:
+        defaults = self.CONFIG_DEFAULTS
+        if key not in defaults and key not in ("focused_user", "focused_target", "since", "until"):
+            print(f"Unknown key: {key}. Cannot reset.")
+            return
+        if key == "focused_user":
+            self.state.focused_user = None
+            print("focused_user = (none)")
+        elif key == "focused_target":
+            self.state.focused_target = None
+            print("focused_target = (none)")
+        elif key == "since":
+            self.state.since = None
+            print("since = (none)")
+        elif key == "until":
+            self.state.until = None
+            print("until = (none)")
+        elif key in defaults:
+            val = defaults[key]
+            setattr(self.state, key, val)
+            if key in ("color", "color_enabled"):
+                _Color.enabled = True
+            print(f"{key} = {val}")
+
     def do_commands(self, arg: str) -> None:
         """commands   Print all commands with a short description and usage."""
         ref: list[tuple[str, str, str]] = [
@@ -7370,7 +7555,8 @@ class LogShell(cmd.Cmd):
             ("note", "note <user> [<text> | --del]", "Attach a note to a user (persisted)."),
             ("set", "set <key> <value>",
              "Configure: top, llm_url, llm_model, max_chunk_chars, llm_cache, pager, color, webhook_url, webhook_type, plugin_dir."),
-            ("settings", "settings", "Show current settings."),
+("settings", "settings", "Show current settings."),
+            ("config", "config [view|set|reset|llm|display|filters|system]", "View/set grouped configuration."),
             ("sessions", "sessions [user] [gap_min]", "Detect user sessions with configurable gap."),
             ("response_times", "response_times [user] [window_sec]", "Response time analysis between users."),
             ("sentiment", "sentiment [user]", "Sentiment analysis for a user."),
@@ -9192,6 +9378,28 @@ class LogShell(cmd.Cmd):
     def complete_script(self, text, line, begidx, endidx):
         return self._complete_path(text)
 
+    def complete_config(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, ["view", "set", "reset", "llm", "display", "filters", "system"])
+        if prev[1] == "set":
+            if len(prev) == 2:
+                return self._complete_prefix(text, ["top", "llm_url", "llm_model",
+                                                     "max_chunk_chars", "llm_cache",
+                                                     "pager", "color", "webhook_url",
+                                                     "webhook_type", "plugin_dir"])
+            return []
+        if prev[1] == "reset":
+            if len(prev) == 2:
+                return self._complete_prefix(text, ["top", "llm_url", "llm_model",
+                                                     "max_chunk_chars", "llm_cache",
+                                                     "pager", "color", "webhook_url",
+                                                     "webhook_type", "plugin_dir",
+                                                     "focused_user", "focused_target",
+                                                     "since", "until"])
+            return []
+        return []
+
     def complete_view(self, text, line, begidx, endidx):
         prev = line[:begidx].split()
         if len(prev) <= 1:
@@ -9608,6 +9816,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="With --batch, compare two time periods")
     p.add_argument("--top-words", type=int, nargs="?", const=50, default=0,
                    help="With --batch, top N words across logs")
+    p.add_argument("--config", nargs="?", const="view", default=None,
+                   help="With --batch, view/set configuration: --config [view|llm|display|filters|system]")
     args = p.parse_args(argv)
 
     since = parse_iso_arg(args.since) if args.since else None
@@ -10168,6 +10378,21 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.top_words:
             top_words(active, args.top_words)
+            return 0
+
+        if args.config:
+            st_for_config = ShellState(log_path=args.log, entries=active)
+            st_for_config.top_n = args.top
+            st_for_config.llm_url = args.llm_url
+            st_for_config.llm_model = args.llm_model
+            st_for_config.max_chunk_chars = args.max_chunk_chars
+            st_for_config.since = since
+            st_for_config.until = until
+            if args.user:
+                st_for_config.focused_user = args.user
+            shell_tmp = LogShell()
+            shell_tmp.state = st_for_config
+            shell_tmp.do_config(args.config if args.config else "view")
             return 0
 
         if args.similar:
