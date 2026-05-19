@@ -5651,8 +5651,8 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   #messages .msg{padding:2px 0;border-bottom:1px solid #001a00;animation:fadeIn .15s;display:flex;align-items:baseline;gap:4px}
   @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
   .ts{color:#060;white-space:nowrap;flex-shrink:0;font-size:11px}
-  .user{color:#0f0;font-weight:bold;white-space:nowrap;flex-shrink:0;max-width:30%;overflow:hidden;text-overflow:ellipsis}
-  .lvl{color:#0a0;white-space:nowrap;flex-shrink:0;max-width:20%;overflow:hidden;text-overflow:ellipsis}
+  .user{color:#0f0;font-weight:bold;flex-shrink:0;white-space:pre-wrap;word-break:break-all}
+  .lvl{color:#0a0;flex-shrink:0;white-space:pre-wrap;word-break:break-all}
   .txt{color:#0c0;flex:1;min-width:0;white-space:pre-wrap;word-break:break-all}
   .highlight{background:#0f01;border-left:2px solid #0f0;padding-left:6px}
   .cmd{color:#ff0;font-weight:bold;border-left:2px solid #ff0;padding-left:6px;margin-top:4px}
@@ -5661,9 +5661,9 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   #menu{flex:1;overflow-y:auto;padding:10px 14px;font-size:12px;line-height:1.5;max-width:420px}
   #menu .mc{color:#060;font-size:11px;margin-bottom:6px;padding-bottom:3px;border-bottom:1px solid #030}
   #menu .mr{display:flex;padding:1px 0}
-  #menu .mr .mn{color:#0f0;width:110px;flex-shrink:0;font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  #menu .mr .mu{color:#080;width:140px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  #menu .mr .md{color:#0a0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #menu .mr .mn{color:#0f0;width:110px;flex-shrink:0;font-weight:bold;white-space:pre-wrap;word-break:break-all}
+  #menu .mr .mu{color:#080;width:140px;flex-shrink:0;white-space:pre-wrap;word-break:break-all}
+  #menu .mr .md{color:#0a0;flex:1;min-width:0;white-space:pre-wrap;word-break:break-all}
   #menu .mr:hover{background:#0f01}
   #tabMenuView{flex-direction:row!important}
   #output{flex:1;overflow-y:auto;padding:6px 10px;font-size:13px;line-height:1.5;min-width:0;border-right:1px solid #030}
@@ -5679,7 +5679,7 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   #dash .dg .row .k{color:#080}
   #dash .dg .row .v{color:#0f0}
   #dash .bar{display:flex;align-items:center;gap:6px;margin:1px 0}
-  #dash .bar .bk{color:#0f0;width:90px;text-align:right;font-size:11px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:bold}
+  #dash .bar .bk{color:#0f0;width:90px;text-align:right;font-size:11px;flex-shrink:0;white-space:pre-wrap;word-break:break-all;font-weight:bold}
   #dash .bar .bf{height:12px;background:#0f0;border-radius:1px;min-width:2px;transition:width .3s}
   #dash .bar .bv{color:#060;font-size:11px;flex-shrink:0;width:30px;text-align:right}
   #dash .dp{color:#030;font-size:10px}
@@ -5689,13 +5689,20 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   #dash .dpd{display:flex;align-items:flex-end;gap:1px;padding:4px 0;height:36px;overflow-x:auto}
   #dash .dpd .db{width:8px;background:#0f0;border-radius:1px 1px 0 0;min-height:1px;flex-shrink:0;transition:height .15s}
   #dash .errs{color:#f00;font-size:11px}
-  #dash .errs .er{color:#f44;padding:1px 0;border-bottom:1px solid #300;white-space:pre-wrap;overflow:hidden;text-overflow:ellipsis;max-height:40px}
+  #dash .errs .er{color:#f44;padding:1px 0;border-bottom:1px solid #300;white-space:pre-wrap;word-break:break-all}
   #footer{display:flex;align-items:center;border-top:1px solid #030;padding:6px 10px;gap:6px;background:#000;flex-shrink:0}
   #footer .prompt{color:#0f0;font-weight:bold}
   #footer input{flex:1;background:#000;color:#0f0;border:1px solid #030;padding:7px 10px;font-family:'Courier New',monospace;font-size:13px;outline:none}
   #footer input:focus{border-color:#0f0}
   #footer input::placeholder{color:#060}
   #status{font-size:11px;color:#060;margin-left:auto}
+  #autocomplete{position:absolute;bottom:100%;left:0;right:0;background:#001a00;border:1px solid #0f0;border-bottom:none;display:none;max-height:220px;overflow-y:auto;z-index:100}
+  #autocomplete .ac-item{padding:3px 10px;cursor:pointer;font-size:13px;display:flex;align-items:baseline;gap:6px}
+  #autocomplete .ac-item:hover,#autocomplete .ac-item.ac-sel{background:#003300;color:#0f0}
+  #autocomplete .ac-item .ac-n{color:#0f0;font-weight:bold;min-width:110px;flex-shrink:0;font-family:'Courier New',monospace;font-size:12px}
+  #autocomplete .ac-item .ac-u{color:#060;font-size:11px;min-width:130px;flex-shrink:0}
+  #autocomplete .ac-item .ac-d{color:#0a0;font-size:11px;flex:1;min-width:0}
+  #footer-wrapper{position:relative}
   ::-webkit-scrollbar{width:6px}
   ::-webkit-scrollbar-track{background:#000}
   ::-webkit-scrollbar-thumb{background:#030;border-radius:3px}
@@ -5713,15 +5720,21 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   <div id="tabDashView" class="tab-content"><div id="dash"></div></div>
   <div id="tabLogsView" class="tab-content"><div id="messages"></div></div>
 </div>
-<div id="footer">
-  <span class="prompt">$</span>
-  <input id="input" type="text" placeholder="type a command and press Enter" autofocus spellcheck="false">
-  <span id="status">ready</span>
+<div id="footer-wrapper">
+  <div id="autocomplete"></div>
+  <div id="footer">
+    <span class="prompt">$</span>
+    <input id="input" type="text" placeholder="type a command and press Enter" autocomplete="off" autofocus spellcheck="false">
+    <span id="status">ready</span>
+  </div>
 </div>
 <script>
 const el=document.getElementById.bind(document);
-const msg=el('messages'), menu=el('menu'), dash=el('dash'), inp=el('input'), cnt=el('count'), sts=el('status'), output=el('output');
+const msg=el('messages'), menu=el('menu'), dash=el('dash'), inp=el('input'), cnt=el('count'), sts=el('status'), output=el('output'), ac=el('autocomplete');
 let lastId=0, activeTab='menu', cmds=null;
+let cmdHistory=JSON.parse(localStorage.getItem('al_cmd_history')||'[]');
+let histIdx=cmdHistory.length;
+let acList=[], acSel=-1, acOpen=false;
 
 function switchTab(tab){
   activeTab=tab;
@@ -5911,13 +5924,126 @@ function sendCmd(cmd){
   });
 }
 
+function historyPush(cmd){
+  if(!cmd||cmd===cmdHistory[cmdHistory.length-1])return;
+  cmdHistory.push(cmd);
+  if(cmdHistory.length>200)cmdHistory=cmdHistory.slice(-200);
+  histIdx=cmdHistory.length;
+  try{localStorage.setItem('al_cmd_history',JSON.stringify(cmdHistory));}catch(e){}
+}
+function historyUp(){
+  if(histIdx>0){histIdx--;inp.value=cmdHistory[histIdx];}
+  closeAc();
+}
+function historyDown(){
+  if(histIdx<cmdHistory.length-1){histIdx++;inp.value=cmdHistory[histIdx];}
+  else{histIdx=cmdHistory.length;inp.value='';}
+  closeAc();
+}
+
+function buildAcItems(filter){
+  if(!cmds)return[];
+  var f=filter.toLowerCase().split(/\s+/)[0]||'';
+  var items=[];
+  for(var i=0;i<cmds.length;i++){
+    var n=cmds[i][0],u=cmds[i][1]||'',d=cmds[i][2]||'';
+    if(!f||n.toLowerCase().indexOf(f)===0)items.push({name:n,usage:u,desc:d});
+  }
+  return items.slice(0,20);
+}
+
+function renderAc(items,typedWord){
+  var html='';
+  for(var i=0;i<items.length;i++){
+    var it=items[i];
+    html+='<div class="ac-item'+(i===acSel?' ac-sel':'')+'" data-idx="'+i+'" data-cmd="'+esc(it.usage||it.name)+'">';
+    html+='<span class="ac-n">'+esc(it.name)+'</span>';
+    html+='<span class="ac-u">'+esc(it.usage)+'</span>';
+    html+='<span class="ac-d">'+esc(it.desc)+'</span>';
+    html+='</div>';
+  }
+  ac.innerHTML=html;
+  ac.style.display=items.length?'block':'none';
+  acOpen=items.length>0;
+  var acNodes=ac.querySelectorAll('.ac-item');
+  for(var j=0;j<acNodes.length;j++){
+    acNodes[j].addEventListener('mousedown',function(ev){
+      ev.preventDefault();
+      var cmd=this.getAttribute('data-cmd');
+      inp.value=cmd+' ';
+      inp.focus();
+      closeAc();
+    });
+  }
+}
+
+function openAc(){
+  var val=inp.value.trim();
+  var word=val.split(/\s+/)[0]||'';
+  acList=buildAcItems(word);
+  acSel=-1;
+  renderAc(acList,word);
+}
+
+function closeAc(){
+  ac.style.display='none';
+  acOpen=false;
+  acSel=-1;
+  acList=[];
+}
+
+function acNav(dir){
+  if(!acOpen)return false;
+  acSel+=dir;
+  if(acSel<0)acSel=0;
+  if(acSel>=acList.length)acSel=acList.length-1;
+  renderAc(acList,'');
+  return true;
+}
+
+function acComplete(){
+  if(acOpen&&acSel>=0&&acSel<acList.length){
+    inp.value=(acList[acSel].usage||acList[acSel].name)+' ';
+    closeAc();
+    return true;
+  }
+  return false;
+}
+
+inp.addEventListener('input',function(){
+  openAc();
+});
+
 inp.addEventListener('keydown',function(e){
   if(e.key==='Enter'){
-    const cmd=this.value.trim();
+    var cmd=this.value.trim();
     this.value='';
+    closeAc();
     if(!cmd)return;
+    historyPush(cmd);
     sendCmd(cmd);
+    return;
   }
+  if(e.key==='ArrowUp'){
+    if(acOpen){e.preventDefault();acNav(-1);return;}
+    e.preventDefault();historyUp();return;
+  }
+  if(e.key==='ArrowDown'){
+    if(acOpen){e.preventDefault();acNav(1);return;}
+    e.preventDefault();historyDown();return;
+  }
+  if(e.key==='Tab'){
+    e.preventDefault();
+    acComplete();
+    return;
+  }
+  if(e.key==='Escape'){
+    if(acOpen){closeAc();return;}
+  }
+});
+
+document.addEventListener('click',function(e){
+  if(acOpen&&!ac.contains(e.target)&&e.target!==inp)closeAc();
 });
 
 fetchLog();setInterval(fetchLog,3000);
