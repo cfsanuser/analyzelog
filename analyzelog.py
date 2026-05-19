@@ -4337,6 +4337,731 @@ def llm_baseline(entries: list[Entry], user: str, llm_url: str, model: str,
         print(f"Baseline analysis failed: {exc}")
 
 
+def llm_summary(entries: list[Entry], llm_url: str, model: str,
+                max_chars: int = 15000, cache: LLMCache | None = None) -> None:
+    """LLM summary of the entire log — key events, trends, anomalies."""
+    active = [e for e in entries if e.user]
+    if not active:
+        print("(no entries)")
+        return
+    s = summarize(entries, 20)
+    evidence: list[str] = [
+        f"FULL LOG SUMMARY ({len(entries)} entries, {len({e.user for e in entries if e.user})} users)",
+        f"Time range: {_fmt_dt(s['first_ts'])} to {_fmt_dt(s['last_ts'])}",
+        f"Formats: {dict(s['formats'])}",
+        f"Levels: {s['levels']}",
+        "",
+        "=== TOP USERS ===",
+    ]
+    for u, n in s["top_users"][:15]:
+        evidence.append(f"  {u}: {n} messages")
+    evidence.append("")
+    evidence.append("=== TOP EVENTS ===")
+    for ev, n in s["top_events"][:10]:
+        evidence.append(f"  {ev}: {n}")
+    if s.get("top_targets"):
+        evidence.append("")
+        evidence.append("=== TOP TARGETS ===")
+        for t, n in s["top_targets"][:10]:
+            evidence.append(f"  {t}: {n}")
+    evidence.append("")
+    evidence.append("=== HOURLY ACTIVITY ===")
+    for h, n in s["by_hour"].items():
+        evidence.append(f"  {h:02d}: {n}")
+    if s["errors"]:
+        evidence.append("")
+        evidence.append("=== ERRORS ===")
+        for err in s["errors"][:15]:
+            evidence.append(f"  {err[:200]}")
+    evidence.append("")
+    evidence.append("=== RECENT MESSAGES ===")
+    for e in sorted(active, key=lambda x: x.ts or datetime.min)[-80:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.user}: {(e.text or e.raw)[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a senior log analyst. Provide a comprehensive executive summary of this log:\n\n"
+        "1. OVERVIEW: What is this log? What system/community does it represent?\n"
+        "2. KEY EVENTS: The 5-10 most significant events or patterns\n"
+        "3. USER LANDSCAPE: Who are the main actors and their roles?\n"
+        "4. TRENDS: Activity patterns, growth, decline, shifts\n"
+        "5. ANOMALIES: Anything unusual or noteworthy\n"
+        "6. ERRORS/ISSUES: Recurring problems or critical failures\n"
+        "7. HEALTH ASSESSMENT: Overall system/community health\n"
+        "8. RECOMMENDATIONS: Top 3 actions to take"
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg="LLM summarizing entire log")
+        print(f"\n{'='*80}\nFULL LOG SUMMARY\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Log summary failed: {exc}")
+
+
+def llm_replay(entries: list[Entry], user: str, llm_url: str, model: str,
+               max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+    """LLM narrates a user's activity as a chronological story."""
+    user_entries = sorted([e for e in entries if line_matches_user(e, user) and e.ts], key=lambda e: e.ts)
+    if not user_entries:
+        print(f"(no timestamped data for '{user}')")
+        return
+    evidence: list[str] = [f"CHRONOLOGICAL REPLAY: {user}"]
+    evidence.append(f"Time span: {_fmt_dt(user_entries[0].ts)} to {_fmt_dt(user_entries[-1].ts)}")
+    evidence.append(f"Total messages: {len(user_entries)}")
+    evidence.append("")
+    for e in user_entries[:100]:
+        evidence.append(f"  [{e.ts.strftime('%H:%M:%S')}] {e.raw[:250]}")
+    if len(user_entries) > 100:
+        evidence.append(f"\n...({len(user_entries) - 100} more messages)")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a narrative analyst. Given a chronological log of a user's messages, "
+        "tell their story as a flowing narrative. Cover:\n\n"
+        "1. THE ARC: What was their journey? Beginning, middle, end\n"
+        "2. KEY MOMENTS: Turning points, breakthroughs, conflicts\n"
+        "3. EVOLUTION: How did their behavior/style change over time?\n"
+        "4. RELATIONSHIPS: Who did they interact with and how?\n"
+        "5. THEMES: What were they consistently focused on?\n\n"
+        "Write it like a character study — engaging but evidence-based."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM replaying {user}'s story")
+        print(f"\n{'='*80}\nCHRONOLOGICAL REPLAY: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Replay failed: {exc}")
+
+
+def llm_predict(entries: list[Entry], user: str, llm_url: str, model: str,
+                max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+    """Predict next likely actions/behavior based on observed patterns."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if len(user_entries) < 10:
+        print(f"(insufficient data for '{user}', need >=10 lines)")
+        return
+    profile = build_profile(user_entries, user)
+    pol = pattern_of_life(user_entries, user)
+    sentiment = user_sentiment(user_entries, user)
+    churn = predict_churn(user_entries, user)
+    recurrences = detect_recurrence(user_entries, user)
+    lc = analyze_lifecycle(user_entries, user)
+
+    evidence: list[str] = [
+        f"PREDICTION ANALYSIS: {user}",
+        f"Authored: {profile['authored']}, Active days: {len(profile['by_day'])}",
+        f"Lifecycle: trend={lc.activity_trend}, stages={len(lc.stages)}",
+        f"Churn risk: {churn.risk_score:.2f} ({', '.join(churn.factors)})",
+        f"Consistency: {pol.consistency_score:.2f}, Peak hour: {pol.peak_hour}",
+    ]
+    if sentiment:
+        evidence.append(f"Sentiment: compound={sentiment['mean_compound']:.3f}, pos={sentiment['pos_rate']:.1%}, neg={sentiment['neg_rate']:.1%}")
+    for r in recurrences:
+        evidence.append(f"Recurrence: [{r.pattern_type}] {r.description}")
+    evidence.append(f"\nScore means: {json.dumps(profile['score_means'], default=str)}")
+    evidence.append(f"\nRecent messages (last 40):")
+    for e in user_entries[-40:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a behavioral forecaster. Based on the evidence, predict this user's "
+        "likely future behavior:\n\n"
+        "1. SHORT-TERM (next 24-48h): What will they likely do next?\n"
+        "2. MEDIUM-TERM (next week): Trends and trajectory\n"
+        "3. LONG-TERM (next month): Where is this heading?\n"
+        "4. RISK SCENARIOS: What could go wrong? (churn, escalation, burnout)\n"
+        "5. POSITIVE SCENARIOS: What could go well? (growth, engagement, leadership)\n"
+        "6. INTERVENTION POINTS: Where could action change the trajectory?\n\n"
+        "Be specific and cite evidence. Give probability estimates."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM predicting behavior for {user}")
+        print(f"\n{'='*80}\nBEHAVIORAL PREDICTION: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Prediction failed: {exc}")
+
+
+def llm_motive(entries: list[Entry], user: str, llm_url: str, model: str,
+               max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+    """Analyze motivations, intent, and psychological drivers."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if len(user_entries) < 10:
+        print(f"(insufficient data for '{user}', need >=10 lines)")
+        return
+    profile = build_profile(user_entries, user)
+    sentiment = user_sentiment(user_entries, user)
+    topics = user_topics(user_entries, user)
+
+    evidence: list[str] = [
+        f"MOTIVATION ANALYSIS: {user}",
+        f"Messages: {profile['authored']}, Score means: {json.dumps(profile['score_means'], default=str)}",
+    ]
+    if sentiment:
+        evidence.append(f"Sentiment: compound={sentiment['mean_compound']:.3f}, agreement={sentiment['agree_rate']:.1%}")
+    if topics.get("keywords"):
+        evidence.append(f"Top keywords: {', '.join(f'{kw}({n})' for kw, n in topics['keywords'][:10])}")
+    if topics.get("bigrams"):
+        evidence.append(f"Top bigrams: {', '.join(f'{bg}({n})' for bg, n in topics['bigrams'][:5])}")
+    evidence.append(f"\nAll messages:")
+    for e in user_entries[-80:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a motivational psychologist analyzing behavioral data. Determine what drives "
+        "this person's participation:\n\n"
+        "1. PRIMARY MOTIVATORS: What core needs drive their behavior? (achievement, belonging, "
+        "   power, curiosity, validation, altruism, etc.)\n"
+        "2. GOAL ORIENTATION: What are they trying to accomplish?\n"
+        "3. EMOTIONAL DRIVERS: What emotions fuel their engagement?\n"
+        "4. COGNITIVE STYLE: How do they think and process information?\n"
+        "5. SOCIAL NEEDS: What do they seek from others?\n"
+        "6. FRUSTRATION POINTS: What triggers negative responses?\n"
+        "7. REWARD SENSITIVITY: What reinforces their behavior?\n"
+        "8. UNDERLYING INTENT: What's their deeper agenda (conscious or unconscious)?"
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM analyzing motives for {user}")
+        print(f"\n{'='*80}\nMOTIVATION ANALYSIS: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Motivation analysis failed: {exc}")
+
+
+def llm_relationship(entries: list[Entry], a: str, b: str, llm_url: str, model: str,
+                     max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+    """Deep relationship analysis between two users."""
+    a_entries = [e for e in entries if line_matches_user(e, a)]
+    b_entries = [e for e in entries if line_matches_user(e, b)]
+    interactions = [e for e in entries if line_is_interaction(e, a, b)]
+    if not interactions and not a_entries and not b_entries:
+        print(f"(no data for {a} or {b})")
+        return
+    pa = build_profile(a_entries, a) if a_entries else None
+    pb = build_profile(b_entries, b) if b_entries else None
+    edges = build_edge_graph(entries)
+    a_to_b = edges.get((a, b), 0)
+    b_to_a = edges.get((b, a), 0)
+
+    evidence: list[str] = [f"RELATIONSHIP ANALYSIS: {a} <-> {b}"]
+    evidence.append(f"Direct interactions: {len(interactions)}")
+    evidence.append(f"Edge weights: {a} -> {b}: {a_to_b}, {b} -> {a}: {b_to_a}")
+    if pa:
+        evidence.append(f"\n{a}: lines={pa['authored']}, scores={json.dumps(pa['score_means'], default=str)}")
+    if pb:
+        evidence.append(f"{b}: lines={pb['authored']}, scores={json.dumps(pb['score_means'], default=str)}")
+    evidence.append(f"\nInteraction log:")
+    for e in interactions[:60]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.user}: {(e.text or e.raw)[:200]}")
+    if not interactions:
+        evidence.append("  (no direct interactions — analyzing parallel behavior)")
+        evidence.append(f"\n{a}'s recent messages:")
+        for e in a_entries[-20:]:
+            evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+        evidence.append(f"\n{b}'s recent messages:")
+        for e in b_entries[-20:]:
+            evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a relationship analyst. Analyze the dynamic between these two people:\n\n"
+        "1. RELATIONSHIP TYPE: Mentor/mentee, peers, rivals, collaborators, etc.\n"
+        "2. POWER DYNAMIC: Who leads? Who follows? Is it balanced?\n"
+        "3. TRUST LEVEL: How much do they trust each other?\n"
+        "4. COMMUNICATION PATTERN: Frequency, tone, depth, reciprocity\n"
+        "5. CONFLICT AREAS: Where do they disagree? How do they handle it?\n"
+        "6. SYNERGY: Do they produce better outcomes together?\n"
+        "7. DEPENDENCY: Is one dependent on the other?\n"
+        "8. TRAJECTORY: Is the relationship strengthening, weakening, or stable?\n"
+        "9. HIDDEN DYNAMICS: What's not being said? Subtext?"
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM analyzing {a} <-> {b} relationship")
+        print(f"\n{'='*80}\nRELATIONSHIP ANALYSIS: {a} <-> {b}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Relationship analysis failed: {exc}")
+
+
+def llm_audit(entries: list[Entry], llm_url: str, model: str,
+              max_chars: int = 15000, cache: LLMCache | None = None,
+              policy: str = "") -> None:
+    """Compliance audit against security policies or best practices."""
+    active = [e for e in entries if e.user]
+    if not active:
+        print("(no entries)")
+        return
+    s = summarize(entries, 30)
+    entity_catalog = build_entity_catalog(active)
+    error_entries = [e for e in entries if e.level and e.level.upper() in {"ERROR", "CRITICAL", "FATAL", "HIGH", "SUS"}
+                     or ERROR_TOKENS.search(e.text or "")]
+
+    evidence: list[str] = [
+        f"SECURITY COMPLIANCE AUDIT ({len(entries)} entries, {len({e.user for e in entries if e.user})} users)",
+        f"Time range: {_fmt_dt(s['first_ts'])} to {_fmt_dt(s['last_ts'])}",
+    ]
+    if policy:
+        evidence.append(f"Policy focus: {policy}")
+    evidence.append("")
+    evidence.append("=== LEVELS/SEVERITIES ===")
+    evidence.append(json.dumps(s["levels"], indent=2))
+    evidence.append("")
+    evidence.append("=== ENTITIES ===")
+    for etype, ents in entity_catalog.items():
+        if ents:
+            for ent in sorted(ents, key=lambda x: -x.count)[:5]:
+                evidence.append(f"  {etype}: {ent.value} ({ent.count}x)")
+    evidence.append("")
+    evidence.append(f"=== ERRORS/ALERTS ({len(error_entries)} total) ===")
+    for e in error_entries[:40]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] [{e.level or '?'}] {e.user or '?'}: {(e.text or e.raw)[:200]}")
+    evidence.append("")
+    evidence.append("=== TOP USERS ===")
+    for u, n in s["top_users"][:20]:
+        evidence.append(f"  {u}: {n}")
+    evidence.append("")
+    evidence.append("=== SAMPLE MESSAGES ===")
+    for e in sorted(active, key=lambda x: x.ts or datetime.min)[-100:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.user}: {(e.text or e.raw)[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a security compliance auditor. Review the log data against industry best practices:\n\n"
+        "1. ACCESS CONTROL: Any signs of unauthorized access or privilege escalation?\n"
+        "2. DATA HANDLING: Evidence of sensitive data exposure or mishandling?\n"
+        "3. AUTHENTICATION: Brute force attempts, credential issues?\n"
+        "4. AUDIT TRAIL: Is logging adequate? Any gaps or tampering signs?\n"
+        "5. ERROR HANDLING: Are errors properly handled or do they leak information?\n"
+        "6. POLICY COMPLIANCE: General adherence to security policies" + (f" (focus: {policy})" if policy else "") + "\n"
+        "7. VULNERABILITY INDICATORS: Signs of exploitation or misconfiguration?\n"
+        "8. INCIDENT READINESS: Would the current logging support incident response?\n\n"
+        "For each finding: severity (Critical/High/Medium/Low), evidence, recommendation."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg="LLM running compliance audit")
+        print(f"\n{'='*80}\nSECURITY COMPLIANCE AUDIT\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Audit failed: {exc}")
+
+
+def llm_risk_score(entries: list[Entry], user: str, llm_url: str, model: str,
+                   max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+    """Quantified 0-100 risk score with weighted factor breakdown."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if len(user_entries) < 5:
+        print(f"(insufficient data for '{user}')")
+        return
+    profile = build_profile(user_entries, user)
+    sentiment = user_sentiment(user_entries, user)
+    anomalies = detect_behavioral_anomalies(entries, user)
+    entity_catalog = build_entity_catalog(user_entries)
+    pol = pattern_of_life(user_entries, user)
+    churn = predict_churn(user_entries, user)
+
+    evidence: list[str] = [
+        f"RISK SCORING: {user}",
+        f"Messages: {profile['authored']}, Active days: {len(profile['by_day'])}",
+        f"Score means: {json.dumps(profile['score_means'], default=str)}",
+        f"Sentiment: compound={sentiment.get('mean_compound', 0):.3f}" if sentiment else "",
+        f"Anomalies: {len(anomalies)}",
+        f"Consistency: {pol.consistency_score:.2f}",
+        f"Churn risk: {churn.risk_score:.2f}",
+    ]
+    if anomalies:
+        for a in sorted(anomalies, key=lambda x: abs(x.zscore), reverse=True)[:10]:
+            evidence.append(f"  {a.metric}: z={a.zscore:+.2f}")
+    if entity_catalog:
+        for etype, ents in entity_catalog.items():
+            if ents:
+                evidence.append(f"  {etype}: {', '.join(e.value for e in ents[:5])}")
+    evidence.append(f"\nRecent messages:")
+    for e in user_entries[-50:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a risk analyst. Assign a 0-100 risk score based on the evidence. "
+        "Break down the score into weighted factors:\n\n"
+        "1. BEHAVIORAL RISK (0-25): Anomalies, pattern changes, unusual activity\n"
+        "2. SENTIMENT RISK (0-25): Negativity, aggression, instability\n"
+        "3. ENTITY RISK (0-25): Suspicious IPs, URLs, files, emails\n"
+        "4. SCORE RISK (0-25): High heuristic/binary/classifier/LLM scores\n\n"
+        "Output format:\n"
+        "- OVERALL SCORE: X/100 (Low/Medium/High/Critical)\n"
+        "- FACTOR BREAKDOWN: Each factor with score and evidence\n"
+        "- TOP 3 RISK DRIVERS: What contributes most to the score\n"
+        "- TREND: Increasing, decreasing, or stable risk\n"
+        "- ACTION THRESHOLD: At what score should action be taken?"
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM computing risk score for {user}")
+        print(f"\n{'='*80}\nRISK SCORE: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Risk scoring failed: {exc}")
+
+
+# ---------- Statistical / Analytical -----------------------------------------
+
+def compute_stats(entries: list[Entry], user: str | None = None) -> dict:
+    """Full statistical summary for scores, msg lengths, gaps."""
+    filtered = [e for e in entries if line_matches_user(e, user)] if user else entries
+    if not filtered:
+        return {}
+    scores = collect_scores(filtered, user)
+    msg_lens: list[int] = []
+    for e in filtered:
+        s = _scores_from_raw(e.raw)
+        if isinstance(s.get("msg_len"), int):
+            msg_lens.append(s["msg_len"])
+        elif s.get("msg"):
+            msg_lens.append(len(str(s["msg"])))
+
+    def _stats(vals: list[float], label: str) -> dict:
+        if not vals:
+            return {"label": label, "n": 0}
+        s = sorted(vals)
+        return {
+            "label": label, "n": len(vals),
+            "mean": statistics.mean(vals),
+            "median": statistics.median(vals),
+            "stdev": statistics.pstdev(vals) if len(vals) > 1 else 0,
+            "min": min(vals), "max": max(vals),
+            "p10": s[int(len(s) * 0.1)],
+            "p25": s[int(len(s) * 0.25)],
+            "p75": s[min(int(len(s) * 0.75), len(s) - 1)],
+            "p90": s[min(int(len(s) * 0.9), len(s) - 1)],
+        }
+
+    result: dict[str, dict] = {}
+    for k, vals in scores.items():
+        result[k] = _stats(vals, k)
+    result["msg_len"] = _stats(msg_lens, "msg_len")
+
+    if len(filtered) >= 2 and all(e.ts for e in filtered):
+        sorted_e = sorted(filtered, key=lambda e: e.ts)
+        gaps = [(sorted_e[i+1].ts - sorted_e[i].ts).total_seconds() for i in range(len(sorted_e)-1)]
+        result["gap_seconds"] = _stats(gaps, "gap_seconds")
+
+    return result
+
+
+def print_stats(stats: dict, user: str | None = None) -> None:
+    label = f" for '{user}'" if user else " (all users)"
+    print(f"\nStatistical summary{label}:")
+    print(f"  {'Metric':<12s} {'n':>7s} {'mean':>8s} {'median':>8s} {'stdev':>8s} {'min':>8s} {'p25':>8s} {'p75':>8s} {'max':>8s}")
+    print(f"  {'-'*12} {'-'*7} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+    for key in (*SCORE_KEYS, "msg_len", "gap_seconds"):
+        s = stats.get(key)
+        if not s or s.get("n", 0) == 0:
+            continue
+        print(f"  {s['label']:<12s} {s['n']:>7d} {s['mean']:>8.3f} {s['median']:>8.3f} "
+              f"{s['stdev']:>8.3f} {s['min']:>8.3f} {s.get('p25', 0):>8.3f} "
+              f"{s.get('p75', 0):>8.3f} {s['max']:>8.3f}")
+
+
+def word_frequency(entries: list[Entry], top_n: int = 50,
+                   extra_stopwords: set[str] | None = None) -> list[tuple[str, int]]:
+    """Word/token frequency analysis across all logs."""
+    counter: Counter = Counter()
+    stops = set(STOPWORDS)
+    if extra_stopwords:
+        stops |= extra_stopwords
+    stops |= {str(k) for k in SCORE_KEYS}
+    token_re = re.compile(r"[A-Za-z][A-Za-z0-9_\-']{2,}")
+    for e in entries:
+        text = e.text or e.raw or ""
+        for tok in token_re.findall(text.lower()):
+            tok = tok.strip("'")
+            if tok not in stops and len(tok) > 2:
+                counter[tok] += 1
+    return counter.most_common(top_n)
+
+
+def print_word_frequency(freq: list[tuple[str, int]], top_n: int = 50) -> None:
+    print(f"\nTop word frequencies ({len(freq)} shown):")
+    max_count = freq[0][1] if freq else 1
+    for word, count in freq[:top_n]:
+        bar = "█" * int(40 * count / max_count)
+        print(f"  {word:<20s} {count:>7d}  {bar}")
+
+
+def user_cooccurrence(entries: list[Entry], window_minutes: int = 5,
+                      top_n: int = 30) -> list[tuple[str, str, int]]:
+    """Which users appear together most often in same time windows."""
+    active = sorted([e for e in entries if e.user and e.ts], key=lambda e: e.ts)
+    if not active:
+        return []
+    pair_counter: Counter = Counter()
+    for i, e in enumerate(active):
+        window_end = e.ts + timedelta(minutes=window_minutes)
+        seen: set[str] = {e.user.lower()}
+        for j in range(i + 1, len(active)):
+            if active[j].ts > window_end:
+                break
+            if active[j].user.lower() not in seen:
+                pair = tuple(sorted([e.user, active[j].user]))
+                pair_counter[pair] += 1
+                seen.add(active[j].user.lower())
+    return [(a, b, c) for (a, b), c in pair_counter.most_common(top_n)]
+
+
+def print_cooccurrence(pairs: list[tuple[str, str, int]]) -> None:
+    if not pairs:
+        print("(no co-occurrences)")
+        return
+    print(f"\nUser co-occurrences (shared time windows):")
+    max_count = pairs[0][2] if pairs else 1
+    for a, b, count in pairs[:30]:
+        bar = "█" * int(30 * count / max_count)
+        print(f"  {a:<20s} + {b:<20s}  {count:>5d}  {bar}")
+
+
+def heatmap_user(entries: list[Entry], top_n: int = 20) -> None:
+    """2D heatmap: users (rows) × hours (columns)."""
+    users = Counter(e.user for e in entries if e.user).most_common(top_n)
+    if not users:
+        print("(no users)")
+        return
+    grid: dict[str, list[int]] = {}
+    for u, _ in users:
+        hourly: Counter = Counter()
+        for e in entries:
+            if e.user == u and e.ts:
+                hourly[e.ts.hour] += 1
+        grid[u] = [hourly.get(h, 0) for h in range(24)]
+    max_val = max(v for row in grid.values() for v in row) or 1
+    glyphs = " ░▒▓█"
+    print(f"\nUser × Hour heatmap ({len(users)} users, 24 hours):")
+    header = "       " + " ".join(f"{h:2d}" for h in range(24))
+    print(header)
+    print("       " + "-" * 71)
+    for u, _ in users:
+        row = grid[u]
+        cells = "".join(glyphs[min(int(v / max_val * 4), 4)] for v in row)
+        print(f"  {u[:15]:<15s} {cells}")
+
+
+def log_coverage(entries: list[Entry]) -> dict:
+    """Log coverage analysis — density, gaps, time range completeness."""
+    ts_entries = sorted([e for e in entries if e.ts], key=lambda e: e.ts)
+    if not ts_entries:
+        return {"status": "no timestamps"}
+    first, last = ts_entries[0].ts, ts_entries[-1].ts
+    span_hours = (last - first).total_seconds() / 3600
+    gaps = [(ts_entries[i+1].ts - ts_entries[i].ts).total_seconds() for i in range(len(ts_entries)-1)]
+    big_gaps = [g for g in gaps if g > 3600]
+    by_day = Counter(e.ts.date() for e in ts_entries)
+    date_range = (last.date() - first.date()).days + 1
+    return {
+        "first": first, "last": last,
+        "span_hours": round(span_hours, 1),
+        "total_entries": len(entries),
+        "ts_entries": len(ts_entries),
+        "density_per_hour": round(len(ts_entries) / max(span_hours, 0.01), 1),
+        "gaps_over_1h": len(big_gaps),
+        "largest_gap_hours": round(max(gaps) / 3600, 1) if gaps else 0,
+        "active_days": len(by_day),
+        "date_range_days": date_range,
+        "coverage_pct": round(len(by_day) / max(date_range, 1) * 100, 1),
+    }
+
+
+def print_coverage(cov: dict) -> None:
+    if cov.get("status") == "no timestamps":
+        print("(no timestamps for coverage analysis)")
+        return
+    print(f"\nLog coverage analysis:")
+    print(f"  Time range:       {cov['first']} → {cov['last']}")
+    print(f"  Span:             {cov['span_hours']:.1f} hours ({cov['date_range_days']} days)")
+    print(f"  Total entries:    {cov['total_entries']}")
+    print(f"  Timestamped:      {cov['ts_entries']}")
+    print(f"  Density:          {cov['density_per_hour']} entries/hour")
+    print(f"  Active days:      {cov['active_days']} / {cov['date_range_days']} ({cov['coverage_pct']}%)")
+    print(f"  Gaps > 1 hour:    {cov['gaps_over_1h']}")
+    print(f"  Largest gap:      {cov['largest_gap_hours']:.1f} hours")
+
+
+# ---------- Export / Integration --------------------------------------------
+
+def export_graphml(edges: Counter, path: str) -> None:
+    """Export interaction graph as GraphML for Gephi/network analysis."""
+    nodes: set[str] = set()
+    for (a, b) in edges:
+        nodes.add(a)
+        nodes.add(b)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        f.write('<graphml xmlns="http://graphml.graphdrawing.org/xmlns">\n')
+        f.write('  <key id="weight" for="edge" attr.name="weight" attr.type="int"/>\n')
+        f.write('  <graph id="interactions" edgedefault="directed">\n')
+        for node in sorted(nodes):
+            f.write(f'    <node id="{html_mod.escape(node)}"/>\n')
+        for (a, b), w in edges.most_common():
+            f.write(f'    <edge source="{html_mod.escape(a)}" target="{html_mod.escape(b)}">\n')
+            f.write(f'      <data key="weight">{w}</data>\n')
+            f.write(f'    </edge>\n')
+        f.write('  </graph>\n</graphml>\n')
+    print(f"GraphML exported to {path} ({len(nodes)} nodes, {len(edges)} edges)")
+
+
+def merge_logs(paths: list[str], out_path: str) -> int:
+    """Merge multiple log files chronologically."""
+    all_entries: list[Entry] = []
+    for p in paths:
+        try:
+            all_entries.extend(iter_entries(p))
+        except FileNotFoundError:
+            print(f"File not found: {p}", file=sys.stderr)
+    all_entries.sort(key=lambda e: e.ts or datetime.min)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for e in all_entries:
+            f.write(e.raw + "\n")
+    print(f"Merged {len(all_entries)} entries from {len(paths)} files → {out_path}")
+    return len(all_entries)
+
+
+def random_sample(entries: list[Entry], n: int) -> list[Entry]:
+    """Random sample of N entries."""
+    import random
+    if n >= len(entries):
+        return entries
+    return random.sample(entries, n)
+
+
+# ---------- Operational ------------------------------------------------------
+
+def last_seen(entries: list[Entry], user: str | None = None, top_n: int = 20) -> None:
+    """When was each user (or specific user) last active."""
+    if user:
+        u = user.lower()
+        user_entries = [e for e in entries if e.user and e.user.lower() == u and e.ts]
+        if not user_entries:
+            print(f"(no data for '{user}')")
+            return
+        latest = max(user_entries, key=lambda e: e.ts)
+        print(f"\nLast seen for '{user}':")
+        print(f"  {_fmt_dt(latest.ts)}  ({(datetime.now() - latest.ts).days}d ago)")
+        print(f"  {latest.raw[:200]}")
+    else:
+        latest_per_user: dict[str, Entry] = {}
+        for e in entries:
+            if e.user and e.ts:
+                u = e.user
+                if u not in latest_per_user or e.ts > latest_per_user[u].ts:
+                    latest_per_user[u] = e
+        sorted_users = sorted(latest_per_user.items(), key=lambda x: -x[1].ts.timestamp())
+        print(f"\nLast seen (top {min(top_n, len(sorted_users))} users):")
+        print(f"  {'User':<25s} {'Last seen':<20s} {'Ago':<10s} {'Message'}")
+        print(f"  {'-'*25} {'-'*20} {'-'*10} {'-'*40}")
+        for u, e in sorted_users[:top_n]:
+            ago = (datetime.now() - e.ts).total_seconds()
+            if ago < 3600:
+                ago_str = f"{ago/60:.0f}m"
+            elif ago < 86400:
+                ago_str = f"{ago/3600:.1f}h"
+            else:
+                ago_str = f"{ago/86400:.0f}d"
+            print(f"  {u:<25s} {_fmt_dt(e.ts):<20s} {ago_str:<10s} {(e.text or e.raw)[:60]}")
+
+
+def whois(entries: list[Entry], user: str) -> None:
+    """One-command dump: profile + sentiment + anomalies + edges for a user."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if not user_entries:
+        print(f"(no data for '{user}')")
+        return
+    profile = build_profile(user_entries, user)
+    sentiment = user_sentiment(user_entries, user)
+    anomalies = detect_anomalies(entries, user)
+    edges = build_edge_graph(user_entries)
+    pol = pattern_of_life(user_entries, user)
+    churn = predict_churn(user_entries, user)
+
+    print(f"\n{'='*60}")
+    print(f"WHOIS: {user}")
+    print(f"{'='*60}")
+    print(f"  Authored: {profile['authored']}  |  Mentioned: {profile['mentioned_by_others']}")
+    print(f"  First seen: {_fmt_dt(profile['first_ts'])}")
+    print(f"  Last seen:  {_fmt_dt(profile['last_ts'])}")
+    print(f"  Active days: {len(profile['by_day'])}  |  Peak: {_peak_hours(profile['by_hour'])}")
+    print(f"  Top channels: {_top_str(profile['channels'], 3) or '—'}")
+    print(f"  Flags: {_top_str(profile['flags'], 4) or '—'}")
+    print(f"  Score means: heu={_fmt_score(profile['score_means']['heu'])} "
+          f"bino={_fmt_score(profile['score_means']['bino'])} "
+          f"cls={_fmt_score(profile['score_means']['cls'])} "
+          f"llama={_fmt_score(profile['score_means']['llama'])}")
+    if sentiment:
+        print(f"  Sentiment: compound={sentiment['mean_compound']:.3f} "
+              f"pos={sentiment['pos_rate']:.1%} neg={sentiment['neg_rate']:.1%}")
+    if anomalies:
+        print(f"  Anomalies: {len(anomalies)} (top: {anomalies[0].metric} z={anomalies[0].zscore:+.2f})")
+    if edges:
+        top_edges = edges.most_common(5)
+        print(f"  Top edges: {', '.join(f'{a}->{b}({w})' for (a,b),w in top_edges)}")
+    print(f"  Pattern consistency: {pol.consistency_score:.2f}  |  Peak hour: {pol.peak_hour}")
+    level = "HIGH" if churn.risk_score > 0.6 else "MEDIUM" if churn.risk_score > 0.3 else "LOW"
+    print(f"  Churn risk: {level} ({churn.risk_score:.2f})")
+
+
+def diff_time(entries: list[Entry], since_str: str, until_str: str) -> None:
+    """Compare activity in two time periods."""
+    since_a = parse_iso_arg(since_str)
+    until_a = parse_iso_arg(until_str)
+    if not since_a or not until_a:
+        print("Could not parse dates. Use ISO format or '5h ago'.")
+        return
+    span_a = (until_a - since_a).total_seconds()
+    since_b = since_a - timedelta(seconds=span_a)
+    until_b = since_a
+    period_a = apply_time_filter(entries, since_a, until_a)
+    period_b = apply_time_filter(entries, since_b, until_b)
+    sa = summarize(period_a, 15)
+    sb = summarize(period_b, 15)
+    print(f"\nTime comparison:")
+    print(f"  Period A: {since_a} → {until_a} ({sa['total']} entries)")
+    print(f"  Period B: {since_b} → {until_b} ({sb['total']} entries)")
+    delta = sa['total'] - sb['total']
+    print(f"  Δ entries: {delta:+d} ({delta/max(sb['total'],1)*100:+.0f}%)")
+    a_users = dict(sa["top_users"])
+    b_users = dict(sb["top_users"])
+    all_users = set(a_users) | set(b_users)
+    deltas = sorted(((u, a_users.get(u, 0) - b_users.get(u, 0)) for u in all_users), key=lambda x: -abs(x[1]))
+    print(f"\n  Top user deltas (A - B):")
+    for u, d in deltas[:15]:
+        print(f"    {d:+6d}  {u}")
+
+
+def top_words(entries: list[Entry], top_n: int = 50) -> None:
+    """Top N words/tokens across all log text."""
+    freq = word_frequency(entries, top_n)
+    print_word_frequency(freq, top_n)
+
+
 # ---------- exports ---------------------------------------------------------
 
 def serialize_profile(profile: dict, sample_cap: int = 200) -> dict:
@@ -4858,6 +5583,25 @@ PORTAL_COMMANDS: list[tuple[str, str, str]] = [
     ("llm_topics", "llm_topics [N]", "Topic map across users."),
     ("llm_sessions", "llm_sessions [user]", "Compare behavior across sessions."),
     ("llm_baseline", "llm_baseline [user]", "Behavioral baseline & deviations."),
+    ("llm_summary", "llm_summary", "LLM summary of entire log."),
+    ("llm_replay", "llm_replay [user]", "LLM chronological story replay."),
+    ("llm_predict", "llm_predict [user]", "Predict future behavior."),
+    ("llm_motive", "llm_motive [user]", "Motivation & intent analysis."),
+    ("llm_relationship", "llm_relationship <A> <B>", "Deep relationship analysis."),
+    ("llm_audit", "llm_audit [policy]", "Security compliance audit."),
+    ("llm_risk", "llm_risk [user]", "Quantified 0-100 risk score."),
+    ("stats", "stats [user]", "Statistical summary (mean/median/stdev)."),
+    ("frequency", "frequency [N]", "Word/token frequency analysis."),
+    ("cooccurrence", "cooccurrence [window]", "User co-occurrence in time windows."),
+    ("heatmap_user", "heatmap_user [N]", "2D user×hour heatmap."),
+    ("coverage", "coverage", "Log coverage analysis."),
+    ("export_graphml", "export_graphml <path>", "Export graph as GraphML."),
+    ("merge", "merge <f1> <f2> ... <out>", "Merge log files chronologically."),
+    ("sample", "sample <N>", "Random sample of N entries."),
+    ("last_seen", "last_seen [user]", "Last active time per user."),
+    ("whois", "whois <user>", "One-command user dump."),
+    ("diff_time", "diff_time <since> <until>", "Compare two time periods."),
+    ("top_words", "top_words [N]", "Top N words across logs."),
     # --- multi-log / export ---
     ("multi", "multi {add|list|clear|report}", "Multi-log aggregation."),
     ("aggregate", "aggregate", "Alias for multi report."),
@@ -5059,7 +5803,7 @@ function renderMenu(data){
             'filters':['focus','target','since','until','view','ignore'],
             'interaction':['response_times','session_times','influence','sequences','rootcause','correlate'],
             'forensic':['entities','gaps','reconstruct','forensic_report','timeline_narrative','evidence'],
-            'llm':['analyze','ask','askall','interact','compare','compare-auto','tag','tagall','explain','summarize','cluster','auto_report','drift-explain','llm_search','llm_threat','llm_bot','llm_profile','llm_insider','llm_social','llm_incident','llm_topics','llm_sessions','llm_baseline'],
+            'llm':['analyze','ask','askall','interact','compare','compare-auto','tag','tagall','explain','summarize','cluster','auto_report','drift-explain','llm_search','llm_threat','llm_bot','llm_profile','llm_insider','llm_social','llm_incident','llm_topics','llm_sessions','llm_baseline','llm_summary','llm_replay','llm_predict','llm_motive','llm_relationship','llm_audit','llm_risk'],
             'multi':['multi','aggregate','export_html','export_html_drilldown','export_sql','sql','save_profile','load_profile','compare_profiles'],
             'config':['settings','set','alias','note','load','reload','save_config','load_config','rules','web','webportal','webhook'],
             'system':['commands','help','quit','script','export','cron','dashboard','watch','watch_alert','alert_fatigue']};
@@ -6575,6 +7319,25 @@ class LogShell(cmd.Cmd):
             ("llm_topics", "llm_topics [N]", "Topic map: discussion topics and cross-user connections."),
             ("llm_sessions", "llm_sessions [user]", "Compare user behavior across different sessions."),
             ("llm_baseline", "llm_baseline [user]", "Establish behavioral baseline and flag deviations."),
+            ("llm_summary", "llm_summary", "LLM summary of entire log (key events, trends, anomalies)."),
+            ("llm_replay", "llm_replay [user]", "LLM narrates user's activity as chronological story."),
+            ("llm_predict", "llm_predict [user]", "Predict next likely actions/behavior."),
+            ("llm_motive", "llm_motive [user]", "Analyze motivations, intent, psychological drivers."),
+            ("llm_relationship", "llm_relationship <A> <B>", "Deep relationship analysis between two users."),
+            ("llm_audit", "llm_audit [policy]", "Security compliance audit against best practices."),
+            ("llm_risk", "llm_risk [user]", "Quantified 0-100 risk score with factor breakdown."),
+            ("stats", "stats [user]", "Full statistical summary (mean/median/stdev/percentiles)."),
+            ("frequency", "frequency [N]", "Word/token frequency analysis across all logs."),
+            ("cooccurrence", "cooccurrence [window_min]", "User co-occurrence in time windows."),
+            ("heatmap_user", "heatmap_user [N]", "2D heatmap: users (rows) × hours (columns)."),
+            ("coverage", "coverage", "Log coverage analysis — density, gaps, completeness."),
+            ("export_graphml", "export_graphml <path>", "Export interaction graph as GraphML for Gephi."),
+            ("merge", "merge <f1> <f2> ... <out>", "Merge multiple log files chronologically."),
+            ("sample", "sample <N>", "Random sample of N entries."),
+            ("last_seen", "last_seen [user]", "When was each user (or specific user) last active."),
+            ("whois", "whois <user>", "One-command dump: profile+sentiment+anomalies+edges."),
+            ("diff_time", "diff_time <since> <until>", "Compare activity in two equal time periods."),
+            ("top_words", "top_words [N]", "Top N words/tokens across all log text."),
             ("commands", "commands  (or ??)", "Print this reference."),
             ("help", "help [name]  (or ?<name>)", "Built-in help."),
             ("quit", "quit  (exit, Ctrl-D)", "Exit the shell."),
@@ -8098,6 +8861,158 @@ class LogShell(cmd.Cmd):
                      self.state.llm_model, self.state.max_chunk_chars,
                      cache=self.state.llm_cache)
 
+    def do_llm_summary(self, arg: str) -> None:
+        """llm_summary   LLM summary of the entire log."""
+        llm_summary(self.state.entries, self.state.llm_url,
+                    self.state.llm_model, self.state.max_chunk_chars,
+                    cache=self.state.llm_cache)
+
+    def do_llm_replay(self, arg: str) -> None:
+        """llm_replay [user]   LLM narrates a user's activity as a story."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        llm_replay(self.state.entries, user, self.state.llm_url,
+                   self.state.llm_model, self.state.max_chunk_chars,
+                   cache=self.state.llm_cache)
+
+    def do_llm_predict(self, arg: str) -> None:
+        """llm_predict [user]   Predict next likely actions/behavior."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        llm_predict(self.state.entries, user, self.state.llm_url,
+                    self.state.llm_model, self.state.max_chunk_chars,
+                    cache=self.state.llm_cache)
+
+    def do_llm_motive(self, arg: str) -> None:
+        """llm_motive [user]   Analyze motivations and psychological drivers."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        llm_motive(self.state.entries, user, self.state.llm_url,
+                   self.state.llm_model, self.state.max_chunk_chars,
+                   cache=self.state.llm_cache)
+
+    def do_llm_relationship(self, arg: str) -> None:
+        """llm_relationship <A> <B>   Deep relationship analysis between two users."""
+        parts = self._split(arg)
+        if len(parts) < 2:
+            print("Usage: llm_relationship <userA> <userB>")
+            return
+        llm_relationship(self.state.entries, parts[0], parts[1],
+                         self.state.llm_url, self.state.llm_model,
+                         self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    def do_llm_audit(self, arg: str) -> None:
+        """llm_audit [policy]   Compliance audit against security policies."""
+        llm_audit(self.state.entries, self.state.llm_url,
+                  self.state.llm_model, self.state.max_chunk_chars,
+                  cache=self.state.llm_cache, policy=arg.strip())
+
+    def do_llm_risk(self, arg: str) -> None:
+        """llm_risk [user]   Quantified 0-100 risk score with factor breakdown."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        llm_risk_score(self.state.entries, user, self.state.llm_url,
+                       self.state.llm_model, self.state.max_chunk_chars,
+                       cache=self.state.llm_cache)
+
+    # --- Statistical / Analytical -------------------------------------------
+
+    def do_stats(self, arg: str) -> None:
+        """stats [user]   Full statistical summary (mean/median/stdev/percentiles)."""
+        user = arg.strip() or None
+        stats = compute_stats(self._active_entries(), user)
+        if not stats:
+            print(f"(no data{' for ' + user if user else ''})")
+            return
+        print_stats(stats, user)
+
+    def do_frequency(self, arg: str) -> None:
+        """frequency [N]   Word/token frequency analysis across all logs."""
+        n = int(arg.strip()) if arg.strip().isdigit() else 50
+        freq = word_frequency(self._active_entries(), n)
+        print_word_frequency(freq, n)
+
+    def do_cooccurrence(self, arg: str) -> None:
+        """cooccurrence [window_min]   Users appearing together in time windows."""
+        window = int(arg.strip()) if arg.strip().isdigit() else 5
+        pairs = user_cooccurrence(self._active_entries(), window)
+        print_cooccurrence(pairs)
+
+    def do_heatmap_user(self, arg: str) -> None:
+        """heatmap_user [N]   2D heatmap: users (rows) × hours (columns)."""
+        n = int(arg.strip()) if arg.strip().isdigit() else 20
+        heatmap_user(self._active_entries(), n)
+
+    def do_coverage(self, arg: str) -> None:
+        """coverage   Log coverage analysis — density, gaps, completeness."""
+        cov = log_coverage(self.state.entries)
+        print_coverage(cov)
+
+    # --- Export / Integration -----------------------------------------------
+
+    def do_export_graphml(self, arg: str) -> None:
+        """export_graphml <path>   Export interaction graph as GraphML for Gephi."""
+        path = arg.strip()
+        if not path:
+            print("Usage: export_graphml <path>")
+            return
+        edges = build_edge_graph(self._active_entries())
+        if not edges:
+            print("(no edges to export)")
+            return
+        export_graphml(edges, path)
+
+    def do_merge(self, arg: str) -> None:
+        """merge <file1> <file2> ... <output>   Merge multiple log files chronologically."""
+        parts = self._split(arg)
+        if len(parts) < 3:
+            print("Usage: merge <file1> <file2> ... <output>")
+            return
+        merge_logs(parts[:-1], parts[-1])
+
+    def do_sample(self, arg: str) -> None:
+        """sample <N>   Random sample of N entries."""
+        parts = self._split(arg)
+        if not parts or not parts[0].isdigit():
+            print("Usage: sample <N>")
+            return
+        n = int(parts[0])
+        sampled = random_sample(self._active_entries(), n)
+        print(f"\nRandom sample ({n} of {len(self._active_entries())} entries):")
+        for i, e in enumerate(sampled, 1):
+            print(f"  [{i}] {_fmt_dt(e.ts)}  {e.user or '?':>15s}  {e.raw[:200]}")
+
+    # --- Operational --------------------------------------------------------
+
+    def do_last_seen(self, arg: str) -> None:
+        """last_seen [user]   When was each user (or specific user) last active."""
+        user = arg.strip() or None
+        last_seen(self._active_entries(), user)
+
+    def do_whois(self, arg: str) -> None:
+        """whois <user>   One-command dump: profile + sentiment + anomalies + edges."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        whois(self._active_entries(), user)
+
+    def do_diff_time(self, arg: str) -> None:
+        """diff_time <since> <until>   Compare activity in two equal time periods."""
+        parts = self._split(arg)
+        if len(parts) < 2:
+            print("Usage: diff_time <since> <until>")
+            return
+        diff_time(self._active_entries(), parts[0], parts[1])
+
+    def do_top_words(self, arg: str) -> None:
+        """top_words [N]   Top N words/tokens across all log text."""
+        n = int(arg.strip()) if arg.strip().isdigit() else 50
+        top_words(self._active_entries(), n)
+
     # --- tab completion ------------------------------------------------------
 
     def complete_user(self, text, line, begidx, endidx):
@@ -8350,6 +9265,44 @@ class LogShell(cmd.Cmd):
         return self._complete_prefix(text, self._nicks())
     def complete_llm_baseline(self, text, line, begidx, endidx):
         return self._complete_prefix(text, self._nicks())
+    def complete_llm_summary(self, text, line, begidx, endidx):
+        return []
+    def complete_llm_replay(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_predict(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_motive(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_relationship(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_audit(self, text, line, begidx, endidx):
+        return []
+    def complete_llm_risk(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_stats(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_frequency(self, text, line, begidx, endidx):
+        return []
+    def complete_cooccurrence(self, text, line, begidx, endidx):
+        return []
+    def complete_heatmap_user(self, text, line, begidx, endidx):
+        return []
+    def complete_coverage(self, text, line, begidx, endidx):
+        return []
+    def complete_export_graphml(self, text, line, begidx, endidx):
+        return self._complete_path(text)
+    def complete_merge(self, text, line, begidx, endidx):
+        return self._complete_path(text)
+    def complete_sample(self, text, line, begidx, endidx):
+        return []
+    def complete_last_seen(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_whois(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_diff_time(self, text, line, begidx, endidx):
+        return []
+    def complete_top_words(self, text, line, begidx, endidx):
+        return []
 
 
 # ---------- main -------------------------------------------------------------
@@ -8498,6 +9451,37 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--llm-sessions", nargs=2, metavar=("USER", "GAP"),
                    help="With --batch, compare sessions: --llm-sessions user 60")
     p.add_argument("--llm-baseline", help="With --batch, behavioral baseline for user")
+    p.add_argument("--llm-summary", action="store_true",
+                   help="With --batch, LLM summary of entire log")
+    p.add_argument("--llm-replay", help="With --batch, LLM chronological replay for user")
+    p.add_argument("--llm-predict", help="With --batch, predict behavior for user")
+    p.add_argument("--llm-motive", help="With --batch, motivation analysis for user")
+    p.add_argument("--llm-relationship", nargs=2, metavar=("A", "B"),
+                   help="With --batch, relationship analysis: --llm-relationship userA userB")
+    p.add_argument("--llm-audit", nargs="?", const="", default=None,
+                   help="With --batch, compliance audit (optional policy focus)")
+    p.add_argument("--llm-risk", help="With --batch, risk score for user")
+    p.add_argument("--stats", nargs="?", const=True, default=None,
+                   help="With --batch, statistical summary (optional user)")
+    p.add_argument("--frequency", type=int, nargs="?", const=50, default=0,
+                   help="With --batch, word frequency analysis (optional top N)")
+    p.add_argument("--cooccurrence", type=int, nargs="?", const=5, default=0,
+                   help="With --batch, user co-occurrence (optional window min)")
+    p.add_argument("--heatmap-user", type=int, nargs="?", const=20, default=0,
+                   help="With --batch, user×hour heatmap (optional top N)")
+    p.add_argument("--coverage", action="store_true",
+                   help="With --batch, log coverage analysis")
+    p.add_argument("--export-graphml", help="With --batch, export graph as GraphML to path")
+    p.add_argument("--merge", nargs="+", metavar="PATH",
+                   help="With --batch, merge log files: --merge f1.log f2.log out.log")
+    p.add_argument("--sample", type=int, help="With --batch, random sample of N entries")
+    p.add_argument("--last-seen", nargs="?", const=True, default=None,
+                   help="With --batch, last seen times (optional user)")
+    p.add_argument("--whois", help="With --batch, one-command user dump")
+    p.add_argument("--diff-time", nargs=2, metavar=("SINCE", "UNTIL"),
+                   help="With --batch, compare two time periods")
+    p.add_argument("--top-words", type=int, nargs="?", const=50, default=0,
+                   help="With --batch, top N words across logs")
     args = p.parse_args(argv)
 
     since = parse_iso_arg(args.since) if args.since else None
@@ -8959,6 +9943,105 @@ def main(argv: list[str] | None = None) -> int:
         if args.llm_baseline:
             llm_baseline(active, args.llm_baseline, args.llm_url, args.llm_model,
                          args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_summary:
+            llm_summary(active, args.llm_url, args.llm_model,
+                        args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_replay:
+            llm_replay(active, args.llm_replay, args.llm_url, args.llm_model,
+                       args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_predict:
+            llm_predict(active, args.llm_predict, args.llm_url, args.llm_model,
+                        args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_motive:
+            llm_motive(active, args.llm_motive, args.llm_url, args.llm_model,
+                       args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_relationship:
+            a, b = args.llm_relationship
+            llm_relationship(active, a, b, args.llm_url, args.llm_model,
+                             args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_audit is not None:
+            llm_audit(active, args.llm_url, args.llm_model,
+                      args.max_chunk_chars, cache=cache, policy=args.llm_audit)
+            return 0
+
+        if args.llm_risk:
+            llm_risk_score(active, args.llm_risk, args.llm_url, args.llm_model,
+                           args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.stats is not None:
+            user = args.stats if isinstance(args.stats, str) else args.user
+            stats = compute_stats(active, user)
+            if stats:
+                print_stats(stats, user)
+            else:
+                print(f"(no data{' for ' + user if user else ''})")
+            return 0
+
+        if args.frequency:
+            top_words(active, args.frequency)
+            return 0
+
+        if args.cooccurrence:
+            pairs = user_cooccurrence(active, args.cooccurrence)
+            print_cooccurrence(pairs)
+            return 0
+
+        if args.heatmap_user:
+            heatmap_user(active, args.heatmap_user)
+            return 0
+
+        if args.coverage:
+            cov = log_coverage(active)
+            print_coverage(cov)
+            return 0
+
+        if args.export_graphml:
+            edges = build_edge_graph(active)
+            if edges:
+                export_graphml(edges, args.export_graphml)
+            else:
+                print("(no edges to export)")
+            return 0
+
+        if args.merge:
+            merge_logs(args.merge[:-1], args.merge[-1])
+            return 0
+
+        if args.sample:
+            sampled = random_sample(active, args.sample)
+            print(f"\nRandom sample ({args.sample} of {len(active)} entries):")
+            for i, e in enumerate(sampled, 1):
+                print(f"  [{i}] {_fmt_dt(e.ts)}  {e.user or '?':>15s}  {e.raw[:200]}")
+            return 0
+
+        if args.last_seen is not None:
+            user = args.last_seen if isinstance(args.last_seen, str) else None
+            last_seen(active, user)
+            return 0
+
+        if args.whois:
+            whois(active, args.whois)
+            return 0
+
+        if args.diff_time:
+            diff_time(active, args.diff_time[0], args.diff_time[1])
+            return 0
+
+        if args.top_words:
+            top_words(active, args.top_words)
             return 0
 
         if args.similar:
