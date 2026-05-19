@@ -3753,6 +3753,590 @@ def llm_evidence_extraction(entries: list[Entry], user: str, llm_url: str, model
         print(f"Evidence extraction failed: {exc}")
 
 
+# ---------- NEW LLM commands -------------------------------------------------
+
+def llm_search(entries: list[Entry], query: str, llm_url: str, model: str,
+               max_chars: int = 12000, cache: LLMCache | None = None,
+               top_k: int = 20) -> None:
+    """Natural language semantic search: LLM finds relevant log lines."""
+    if not entries:
+        print("(no entries to search)")
+        return
+    lines = [e.raw for e in entries if e.raw]
+    chunks = chunk_lines(lines, max_chars)
+    system = (
+        "You are a log search engine. Given a user's natural language query and a batch of log lines, "
+        "return ONLY the line numbers (1-indexed) that are relevant to the query, one per line. "
+        "Do NOT explain. Format: just numbers, e.g.:\n3\n7\n12\n"
+        "If no lines are relevant, return: NONE"
+    )
+    all_hits: set[int] = set()
+    offset = 0
+    for i, chunk in enumerate(chunks, 1):
+        prompt = f"Query: {query}\n\nLog lines (numbered):\n"
+        for j, ln in enumerate(chunk.split("\n"), 1):
+            prompt += f"{offset + j}: {ln}\n"
+        try:
+            out = call_llm_cached(llm_url, model, system, prompt, cache=cache,
+                                  spinner_msg=f"LLM searching chunk {i}/{len(chunks)}")
+            for line in out.strip().split("\n"):
+                line = line.strip()
+                if line.isdigit():
+                    all_hits.add(int(line))
+        except Exception as exc:
+            print(f"  [chunk {i}] error: {exc}", file=sys.stderr)
+        offset += len(chunk.split("\n"))
+    if not all_hits:
+        print(f"\nNo results for: {query}")
+        return
+    all_hits = sorted(h for h in all_hits if 1 <= h <= len(entries))[:top_k]
+    print(f"\nSearch: \"{query}\" ({len(all_hits)} results, top {top_k}):")
+    for idx in all_hits:
+        e = entries[idx - 1]
+        ts = _fmt_dt(e.ts)
+        user = e.user or "?"
+        print(f"  [{idx:>5d}] {ts}  {user:>15s}  {e.raw[:250]}")
+
+
+def llm_threat_assessment(entries: list[Entry], user: str, llm_url: str, model: str,
+                          max_chars: int = 15000, cache: LLMCache | None = None) -> None:
+    """LLM threat assessment: evaluates risk level of a user."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if len(user_entries) < 5:
+        print(f"(insufficient data for '{user}', need >=5 lines)")
+        return
+    profile = build_profile(user_entries, user)
+    sentiment = user_sentiment(user_entries, user)
+    anomalies = detect_behavioral_anomalies(entries, user)
+    entity_catalog = build_entity_catalog(user_entries)
+    edges = build_edge_graph(user_entries)
+
+    evidence: list[str] = [
+        f"THREAT ASSESSMENT REQUEST: {user}",
+        f"Lines authored: {profile['authored']}",
+        f"First/Last seen: {_fmt_dt(profile['first_ts'])} / {_fmt_dt(profile['last_ts'])}",
+        f"Active days: {len(profile['by_day'])}",
+        f"Peak hours: {_peak_hours(profile['by_hour'])}",
+        f"Score means: {json.dumps(profile['score_means'], default=str)}",
+    ]
+    if sentiment:
+        evidence.append(f"Sentiment: compound={sentiment['mean_compound']:.3f}, pos_rate={sentiment['pos_rate']:.1%}, neg_rate={sentiment['neg_rate']:.1%}")
+    if anomalies:
+        evidence.append(f"Anomalies detected: {len(anomalies)}")
+        for a in sorted(anomalies, key=lambda x: abs(x.zscore), reverse=True)[:10]:
+            evidence.append(f"  {a.metric}: z={a.zscore:+.2f} val={a.value:.1f}")
+    if entity_catalog:
+        for etype, ents in entity_catalog.items():
+            if ents:
+                vals = ", ".join(e.value for e in sorted(ents, key=lambda x: -x.count)[:5])
+                evidence.append(f"  Entities ({etype}): {vals}")
+    if edges:
+        top_edges = edges.most_common(10)
+        evidence.append(f"  Top interaction edges: {', '.join(f'{a}->{b}({w})' for (a,b),w in top_edges)}")
+    evidence.append("\nRecent lines:")
+    for e in user_entries[-40:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a threat intelligence analyst. Given behavioral evidence about a user, "
+        "produce a structured threat assessment with:\n"
+        "1. THREAT LEVEL: Low / Medium / High / Critical (with confidence %)\n"
+        "2. INDICATORS: List specific behavioral signals that support the assessment\n"
+        "3. TTPs: Tactics, techniques, and procedures observed\n"
+        "4. RISK FACTORS: What makes this user potentially dangerous\n"
+        "5. MITIGATING FACTORS: What reduces concern\n"
+        "6. RECOMMENDATIONS: Specific actions to take\n"
+        "Be evidence-based, cite concrete data points, and avoid speculation without basis."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM threat assessment for {user}")
+        print(f"\n{'='*80}\nTHREAT ASSESSMENT: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Threat assessment failed: {exc}")
+
+
+def llm_bot_detection(entries: list[Entry], user: str, llm_url: str, model: str,
+                      max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+    """LLM-based bot/automation detection for a user."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if len(user_entries) < 10:
+        print(f"(insufficient data for '{user}', need >=10 lines)")
+        return
+    profile = build_profile(user_entries, user)
+    pol = pattern_of_life(user_entries, user)
+
+    evidence: list[str] = [
+        f"BOT DETECTION ANALYSIS: {user}",
+        f"Total messages: {profile['authored']}",
+        f"Active days: {len(profile['by_day'])}",
+        f"Peak hours: {_peak_hours(profile['by_hour'])}",
+        f"Consistency score: {pol.consistency_score:.2f}",
+    ]
+    hourly = [pol.hourly_profile.get(h, 0) for h in range(24)]
+    evidence.append(f"Hourly distribution: {json.dumps({str(h): round(v, 3) for h, v in pol.hourly_profile.items()})}")
+    evidence.append(f"\nMessage timing analysis:")
+    if user_entries and all(e.ts for e in user_entries):
+        sorted_e = sorted(user_entries, key=lambda e: e.ts)
+        gaps = [(sorted_e[i+1].ts - sorted_e[i].ts).total_seconds() for i in range(len(sorted_e)-1)]
+        if gaps:
+            evidence.append(f"  Mean gap: {statistics.mean(gaps):.1f}s")
+            evidence.append(f"  Median gap: {statistics.median(gaps):.1f}s")
+            evidence.append(f"  Stdev gap: {statistics.pstdev(gaps):.1f}s")
+            cv = statistics.pstdev(gaps) / (statistics.mean(gaps) or 1)
+            evidence.append(f"  Coefficient of variation: {cv:.3f} (low CV = more regular = more bot-like)")
+    evidence.append(f"\nScore profile: {json.dumps(profile['score_means'], default=str)}")
+    evidence.append(f"\nSample messages (last 50):")
+    for e in user_entries[-50:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[-max_chars:]
+
+    system = (
+        "You are a bot detection specialist. Analyze the provided evidence and determine "
+        "whether this user is likely a human, a bot, or a hybrid (human using automation tools).\n"
+        "Consider: timing regularity, message content patterns, score profiles, activity hours, "
+        "linguistic style, and response patterns.\n\n"
+        "Output format:\n"
+        "1. VERDICT: Human / Likely Human / Ambiguous / Likely Bot / Bot (with confidence %)\n"
+        "2. BOT INDICATORS: Evidence suggesting automation\n"
+        "3. HUMAN INDICATORS: Evidence suggesting human behavior\n"
+        "4. AUTOMATION TYPE: If bot-like, what kind? (script, AI, macro, etc.)\n"
+        "5. SOPHISTICATION: How well is the bot disguised?\n"
+        "6. KEY EVIDENCE: Quote the most telling messages or patterns"
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM bot detection for {user}")
+        print(f"\n{'='*80}\nBOT DETECTION: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Bot detection failed: {exc}")
+
+
+def llm_deep_profile(entries: list[Entry], user: str, llm_url: str, model: str,
+                     max_chars: int = 15000, cache: LLMCache | None = None) -> None:
+    """Comprehensive psychological/behavioral profile beyond basic analysis."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if len(user_entries) < 10:
+        print(f"(insufficient data for '{user}', need >=10 lines)")
+        return
+    profile = build_profile(user_entries, user)
+    sentiment = user_sentiment(user_entries, user)
+    topics = user_topics(user_entries, user)
+    pol = pattern_of_life(user_entries, user)
+    recurrences = detect_recurrence(user_entries, user)
+    churn = predict_churn(user_entries, user)
+    threads = build_thread_for_user(user_entries, user)
+
+    evidence: list[str] = [
+        f"DEEP BEHAVIORAL PROFILE: {user}",
+        "",
+        "=== ACTIVITY METRICS ===",
+        f"Authored: {profile['authored']}, Mentioned: {profile['mentioned_by_others']}",
+        f"Active days: {len(profile['by_day'])}, Peak: {_peak_hours(profile['by_hour'])}",
+        f"Score means: {json.dumps(profile['score_means'], default=str)}",
+        f"Mean msg length: {_fmt_num(profile['msg_len_mean'])}",
+        "",
+        "=== SENTIMENT ===",
+    ]
+    if sentiment:
+        evidence.append(f"Compound: {sentiment['mean_compound']:.3f}, Pos: {sentiment['pos_rate']:.1%}, Neg: {sentiment['neg_rate']:.1%}")
+        evidence.append(f"Agreement rate: {sentiment['agree_rate']:.1%}")
+    evidence.append("")
+    evidence.append("=== TOPICS ===")
+    if topics.get("keywords"):
+        evidence.append(f"Keywords: {', '.join(kw for kw, _ in topics['keywords'][:10])}")
+    if topics.get("bigrams"):
+        evidence.append(f"Bigrams: {', '.join(bg for bg, _ in topics['bigrams'][:5])}")
+    evidence.append("")
+    evidence.append("=== PATTERN OF LIFE ===")
+    evidence.append(f"Consistency: {pol.consistency_score:.2f}, Peak hour: {pol.peak_hour}")
+    evidence.append(f"Quiet hours: {pol.quiet_hours}")
+    evidence.append("")
+    evidence.append("=== RECURRENCE ===")
+    for r in recurrences:
+        evidence.append(f"  [{r.pattern_type}] confidence={r.confidence:.0%}: {r.description}")
+    evidence.append("")
+    evidence.append("=== CHURN RISK ===")
+    evidence.append(f"Risk: {churn.risk_score:.2f}, Factors: {', '.join(churn.factors)}")
+    evidence.append("")
+    evidence.append("=== SOCIAL GRAPH ===")
+    reply_targets = Counter()
+    for _, tgt in threads:
+        if tgt:
+            reply_targets[tgt] += 1
+    if reply_targets:
+        for tgt, cnt in reply_targets.most_common(10):
+            evidence.append(f"  Replies to {tgt}: {cnt}")
+    evidence.append("")
+    evidence.append("=== SAMPLE MESSAGES ===")
+    for e in user_entries[-60:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are an expert behavioral psychologist and data analyst. Create a comprehensive "
+        "psychological profile based on the provided log evidence. Structure your analysis:\n\n"
+        "1. PERSONALITY TRAITS: Big Five indicators (Openness, Conscientiousness, Extraversion, "
+        "   Agreeableness, Neuroticism) with evidence\n"
+        "2. COMMUNICATION STYLE: Direct/indirect, formal/casual, verbose/concise, emotional/rational\n"
+        "3. SOCIAL ROLE: Leader, follower, mediator, instigator, lurker, expert, novice\n"
+        "4. MOTIVATION DRIVERS: What seems to drive their participation?\n"
+        "5. COGNITIVE PATTERNS: Problem-solving style, learning patterns, expertise areas\n"
+        "6. EMOTIONAL REGULATION: How they handle stress, conflict, praise, criticism\n"
+        "7. RELATIONSHIP DYNAMICS: How they interact with different people\n"
+        "8. BEHAVIORAL SHIFTS: Any notable changes over time\n"
+        "9. UNIQUE IDENTIFIERS: Distinctive patterns that would help identify this person\n"
+        "10. PREDICTIONS: Likely future behavior based on current trajectory\n\n"
+        "Be specific, cite evidence, and avoid overconfident claims."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM deep profiling {user}")
+        print(f"\n{'='*80}\nDEEP BEHAVIORAL PROFILE: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Deep profiling failed: {exc}")
+
+
+def llm_insider_threat(entries: list[Entry], user: str, llm_url: str, model: str,
+                       max_chars: int = 15000, cache: LLMCache | None = None) -> None:
+    """Insider threat analysis: data exfiltration, policy violations, privilege abuse."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if len(user_entries) < 5:
+        print(f"(insufficient data for '{user}')")
+        return
+    entity_catalog = build_entity_catalog(user_entries)
+    profile = build_profile(user_entries, user)
+    sentiment = user_sentiment(user_entries, user)
+    anomalies = detect_anomalies(entries, user)
+
+    evidence: list[str] = [
+        f"INSIDER THREAT ANALYSIS: {user}",
+        f"Authored lines: {profile['authored']}",
+        f"Time range: {_fmt_dt(profile['first_ts'])} to {_fmt_dt(profile['last_ts'])}",
+        f"Score means: {json.dumps(profile['score_means'], default=str)}",
+    ]
+    if sentiment:
+        evidence.append(f"Sentiment: compound={sentiment['mean_compound']:.3f}")
+    if anomalies:
+        evidence.append(f"Anomalies: {len(anomalies)}")
+        for a in sorted(anomalies, key=lambda x: abs(x.zscore), reverse=True)[:8]:
+            evidence.append(f"  {a.metric}: z={a.zscore:+.2f}")
+    if entity_catalog:
+        evidence.append("\nExtracted entities:")
+        for etype, ents in entity_catalog.items():
+            if ents:
+                for ent in sorted(ents, key=lambda x: -x.count)[:8]:
+                    evidence.append(f"  {etype}: {ent.value} ({ent.count}x)")
+                    if ent.contexts:
+                        evidence.append(f"    e.g. {ent.contexts[0][:150]}")
+    evidence.append("\nAll log lines:")
+    for e in user_entries[-80:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:250]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are an insider threat analyst. Analyze the provided log data for signs of "
+        "malicious insider activity. Look for:\n"
+        "- Data exfiltration indicators (unusual file access, large transfers, external sharing)\n"
+        "- Privilege abuse (accessing resources outside normal scope)\n"
+        "- Policy violations (bypassing controls, unauthorized tools)\n"
+        "- Disgruntled employee signals (negative sentiment, threats, job search activity)\n"
+        "- Unusual timing (access at odd hours, after termination notice)\n"
+        "- Reconnaissance behavior (probing, enumeration, testing boundaries)\n\n"
+        "Output:\n"
+        "1. RISK LEVEL: None / Low / Medium / High / Critical\n"
+        "2. INDICATORS FOUND: Specific evidence for each category\n"
+        "3. ENTITIES OF CONCERN: IPs, URLs, files, emails that are suspicious\n"
+        "4. TIMELINE OF CONCERN: When did suspicious activity occur?\n"
+        "5. FALSE POSITIVE CHECK: What benign explanations exist?\n"
+        "6. RECOMMENDED ACTIONS: Immediate and long-term responses"
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM insider threat analysis for {user}")
+        print(f"\n{'='*80}\nINSIDER THREAT ANALYSIS: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Insider threat analysis failed: {exc}")
+
+
+def llm_social_dynamics(entries: list[Entry], llm_url: str, model: str,
+                        max_chars: int = 15000, cache: LLMCache | None = None,
+                        top_users: int = 15) -> None:
+    """LLM analysis of social dynamics, influence patterns, and group structures."""
+    active = [e for e in entries if e.user]
+    if len(active) < 20:
+        print("(insufficient data, need >=20 entries)")
+        return
+    user_counts = Counter(e.user for e in active)
+    candidates = [u for u, _ in user_counts.most_common(top_users)]
+    edges = build_edge_graph(active)
+    profiles = {u: build_profile(active, u) for u in candidates}
+
+    evidence: list[str] = [
+        f"SOCIAL DYNAMICS ANALYSIS ({len(candidates)} users, {len(edges)} edges)",
+        "",
+        "=== USER ACTIVITY ===",
+    ]
+    for u in candidates:
+        p = profiles[u]
+        evidence.append(f"  {u}: lines={p['authored']}, days={len(p['by_day'])}, "
+                        f"peak={_peak_hours(p['by_hour'])}, "
+                        f"scores={json.dumps(p['score_means'], default=str)}")
+    evidence.append("")
+    evidence.append("=== INTERACTION EDGES (top 30) ===")
+    for (a, b), w in edges.most_common(30):
+        evidence.append(f"  {a} -> {b}: {w}")
+    evidence.append("")
+    evidence.append("=== SAMPLE CONVERSATIONS ===")
+    sample_entries = sorted(active, key=lambda e: e.ts)[-200:]
+    for e in sample_entries:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.user}: {(e.text or e.raw)[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a social network analyst. Analyze the group dynamics in this log data:\n\n"
+        "1. POWER STRUCTURE: Who are the leaders, influencers, and peripheral members?\n"
+        "2. COMMUNITY CLUSTERS: Are there subgroups? Who bridges them?\n"
+        "3. INFORMATION FLOW: How does information spread? Who are the hubs?\n"
+        "4. SOCIAL ROLES: Identify helpers, askers, trolls, experts, lurkers, mediators\n"
+        "5. CONFLICT PATTERNS: Any interpersonal tensions or disagreements?\n"
+        "6. COHESION: How tight-knit is the group? Any isolated members?\n"
+        "7. INFLUENCE CHAINS: Who influences whom? Trace key influence paths\n"
+        "8. HEALTH ASSESSMENT: Overall group health and sustainability\n\n"
+        "Cite specific interaction patterns and metrics as evidence."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg="LLM analyzing social dynamics")
+        print(f"\n{'='*80}\nSOCIAL DYNAMICS ANALYSIS\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Social dynamics analysis failed: {exc}")
+
+
+def llm_incident_timeline(entries: list[Entry], llm_url: str, model: str,
+                           max_chars: int = 15000, cache: LLMCache | None = None,
+                           query: str = "") -> None:
+    """LLM incident timeline reconstruction: finds and narrates a security incident."""
+    active = sorted([e for e in entries if e.ts], key=lambda e: e.ts)
+    if not active:
+        print("(no timestamped entries)")
+        return
+    evidence: list[str] = [
+        f"INCIDENT TIMELINE RECONSTRUCTION",
+        f"Time range: {active[0].ts} to {active[-1].ts}",
+        f"Total entries: {len(active)}",
+    ]
+    if query:
+        evidence.append(f"Focus query: {query}")
+    evidence.append("")
+    evidence.append("=== ERROR/ALERT ENTRIES ===")
+    error_entries = [e for e in active if e.level and e.level.upper() in {"ERROR", "CRITICAL", "FATAL", "HIGH", "SUS", "SUSPICIOUS", "WARN", "WARNING"}
+                     or ERROR_TOKENS.search(e.text or "")]
+    for e in error_entries[:50]:
+        evidence.append(f"  [{e.ts}] [{e.level or '?'}] {e.user or '?'}: {(e.text or e.raw)[:250]}")
+    if not error_entries:
+        evidence.append("  (none found)")
+    evidence.append("")
+    evidence.append("=== FULL CHRONOLOGICAL LOG (last 300 entries) ===")
+    for e in active[-300:]:
+        evidence.append(f"  [{e.ts}] [{e.level or '-'}] {e.user or '?'}: {(e.text or e.raw)[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are an incident response analyst. Reconstruct the incident timeline from the "
+        "provided log data. Produce:\n\n"
+        "1. INCIDENT SUMMARY: What happened in 2-3 sentences\n"
+        "2. TIMELINE: Chronological narrative with timestamps, key events, and phases\n"
+        "   (Initial Access → Execution → Persistence → Lateral Movement → Impact)\n"
+        "3. KEY ACTORS: Users/systems involved and their roles\n"
+        "4. INDICATORS OF COMPROMISE: IPs, hashes, URLs, file paths\n"
+        "5. IMPACT ASSESSMENT: What was affected?\n"
+        "6. ROOT CAUSE: What enabled this incident?\n"
+        "7. RECOMMENDATIONS: Containment, eradication, recovery steps\n\n"
+        "If no incident is evident, state that clearly and describe what the logs do show."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg="LLM reconstructing incident timeline")
+        print(f"\n{'='*80}\nINCIDENT TIMELINE RECONSTRUCTION\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Incident timeline failed: {exc}")
+
+
+def llm_topic_map(entries: list[Entry], llm_url: str, model: str,
+                  max_chars: int = 12000, cache: LLMCache | None = None,
+                  top_users: int = 10) -> None:
+    """LLM topic map: shows what users discuss and how topics connect."""
+    active = [e for e in entries if e.user]
+    if len(active) < 20:
+        print("(insufficient data)")
+        return
+    user_counts = Counter(e.user for e in active)
+    candidates = [u for u, _ in user_counts.most_common(top_users)]
+
+    evidence: list[str] = [f"TOPIC MAP ANALYSIS ({len(candidates)} users)"]
+    for u in candidates:
+        user_lines = [e.text or e.raw for e in active if e.user == u and (e.text or e.raw)]
+        topics = user_topics([e for e in active if e.user == u], u)
+        evidence.append(f"\n=== {u} ({len(user_lines)} messages) ===")
+        if topics.get("keywords"):
+            evidence.append(f"Keywords: {', '.join(f'{kw}({n})' for kw, n in topics['keywords'][:8])}")
+        if topics.get("bigrams"):
+            evidence.append(f"Bigrams: {', '.join(f'{bg}({n})' for bg, n in topics['bigrams'][:5])}")
+        evidence.append("Sample messages:")
+        for ln in user_lines[:15]:
+            evidence.append(f"  {ln[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a topic modeling expert. Analyze the discussion topics across these users:\n\n"
+        "1. TOPIC CLUSTERS: Identify 5-10 main discussion topics\n"
+        "2. USER-TOPIC MATRIX: Which users engage with which topics?\n"
+        "3. TOPIC EXPERTS: Who is the go-to person for each topic?\n"
+        "4. CROSS-TOPIC BRIDGES: Users who connect different topic areas\n"
+        "5. TOPIC EVOLUTION: How topics change over time (if timestamps available)\n"
+        "6. GAPS: Important topics that are under-discussed\n"
+        "7. TOPIC GRAPH: Draw a text-based graph showing topic connections\n\n"
+        "Use the format: TopicA <--UserX--> TopicB to show bridges."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg="LLM building topic map")
+        print(f"\n{'='*80}\nTOPIC MAP ANALYSIS\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Topic map analysis failed: {exc}")
+
+
+def llm_compare_sessions(entries: list[Entry], user: str, llm_url: str, model: str,
+                         max_chars: int = 12000, cache: LLMCache | None = None,
+                         gap_minutes: int = 60) -> None:
+    """Compare a user's behavior across different sessions/time periods."""
+    sessions = detect_sessions(entries, user, gap_minutes)
+    if len(sessions) < 2:
+        print(f"(need >=2 sessions for '{user}', found {len(sessions)})")
+        return
+    evidence: list[str] = [f"SESSION COMPARISON: {user} ({len(sessions)} sessions)"]
+    for i, sess in enumerate(sessions[:10], 1):
+        dur = (sess.end - sess.start).total_seconds()
+        sess_entries = [e for e in entries if e.user and e.user.lower() == user.lower()
+                        and e.ts and sess.start <= e.ts <= sess.end]
+        sentiment = user_sentiment(sess_entries, user) if sess_entries else {}
+        evidence.append(f"\n=== Session {i}: {sess.start} - {sess.end} ({dur/60:.0f}min, {sess.line_count} lines) ===")
+        if sentiment:
+            evidence.append(f"  Sentiment: compound={sentiment.get('mean_compound', 0):.3f}")
+        evidence.append("  Messages:")
+        for e in sess_entries[:20]:
+            evidence.append(f"    [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+    if len(sessions) > 10:
+        evidence.append(f"\n...({len(sessions) - 10} more sessions)")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a behavioral analyst comparing multiple sessions of the same user. Analyze:\n\n"
+        "1. SESSION PATTERNS: How does behavior differ across sessions?\n"
+        "2. MOOD SHIFTS: Changes in sentiment, tone, or engagement level\n"
+        "3. TOPIC SHIFTS: Different subjects discussed in different sessions\n"
+        "4. ACTIVITY RHYTHM: Session duration, intensity, and timing patterns\n"
+        "5. PROGRESSION: Is there a learning curve or degradation over sessions?\n"
+        "6. ANOMALOUS SESSIONS: Any session that stands out as unusual?\n"
+        "7. PREDICTION: What would the next session likely look like?"
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM comparing sessions for {user}")
+        print(f"\n{'='*80}\nSESSION COMPARISON: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Session comparison failed: {exc}")
+
+
+def llm_baseline(entries: list[Entry], user: str, llm_url: str, model: str,
+                 max_chars: int = 12000, cache: LLMCache | None = None) -> None:
+    """Establish behavioral baseline and flag deviations."""
+    user_entries = [e for e in entries if line_matches_user(e, user)]
+    if len(user_entries) < 20:
+        print(f"(insufficient data for '{user}', need >=20 lines)")
+        return
+    profile = build_profile(user_entries, user)
+    pol = pattern_of_life(user_entries, user)
+    sentiment = user_sentiment(user_entries, user)
+    recurrences = detect_recurrence(user_entries, user)
+    scores = collect_scores(user_entries, user)
+
+    evidence: list[str] = [
+        f"BEHAVIORAL BASELINE: {user}",
+        f"Total observations: {len(user_entries)}",
+        f"Active days: {len(profile['by_day'])}",
+        f"Time span: {_fmt_dt(profile['first_ts'])} to {_fmt_dt(profile['last_ts'])}",
+        "",
+        "=== BASELINE METRICS ===",
+        f"Hourly profile: {json.dumps({str(h): round(v, 3) for h, v in pol.hourly_profile.items()})}",
+        f"Weekday profile: {json.dumps({str(d): round(v, 3) for d, v in pol.weekday_profile.items()})}",
+        f"Peak hour: {pol.peak_hour}, Quiet hours: {pol.quiet_hours}",
+        f"Consistency: {pol.consistency_score:.2f}",
+    ]
+    if sentiment:
+        evidence.append(f"Sentiment baseline: compound={sentiment['mean_compound']:.3f}, pos_rate={sentiment['pos_rate']:.1%}")
+    for k in SCORE_KEYS:
+        vals = scores.get(k, [])
+        if vals:
+            evidence.append(f"Score {k}: mean={statistics.mean(vals):.3f}, stdev={statistics.pstdev(vals):.3f}, n={len(vals)}")
+    for r in recurrences:
+        evidence.append(f"Recurrence: [{r.pattern_type}] confidence={r.confidence:.0%}: {r.description}")
+    evidence.append("")
+    evidence.append("=== ALL MESSAGES (for deviation detection) ===")
+    for e in user_entries[-100:]:
+        evidence.append(f"  [{_fmt_dt(e.ts)}] {e.raw[:200]}")
+
+    evidence_text = "\n".join(evidence)
+    if len(evidence_text) > max_chars:
+        evidence_text = evidence_text[:max_chars // 3] + "\n...[TRUNCATED]...\n" + evidence_text[-(2 * max_chars // 3):]
+
+    system = (
+        "You are a behavioral baseline analyst. From the provided data:\n\n"
+        "1. ESTABLISH BASELINE: Define 'normal' behavior for this user across:\n"
+        "   - Activity timing (hours, days, session length)\n"
+        "   - Communication style (tone, length, vocabulary)\n"
+        "   - Score patterns (typical ranges)\n"
+        "   - Social patterns (who they interact with, how often)\n"
+        "2. DEVIATION THRESHOLDS: What would constitute a meaningful deviation?\n"
+        "3. CURRENT DEVIATIONS: Are any messages outside the baseline?\n"
+        "4. TREND ANALYSIS: Is the baseline itself shifting over time?\n"
+        "5. ALERT RULES: Suggest 3-5 specific rules to monitor for anomalies\n\n"
+        "Be precise with numbers and ranges."
+    )
+    try:
+        out = call_llm_cached(llm_url, model, system, evidence_text, cache=cache,
+                              spinner_msg=f"LLM establishing baseline for {user}")
+        print(f"\n{'='*80}\nBEHAVIORAL BASELINE: {user}\n{'='*80}\n{out}\n")
+    except Exception as exc:
+        print(f"Baseline analysis failed: {exc}")
+
+
 # ---------- exports ---------------------------------------------------------
 
 def serialize_profile(profile: dict, sample_cap: int = 200) -> dict:
@@ -4264,6 +4848,16 @@ PORTAL_COMMANDS: list[tuple[str, str, str]] = [
     ("forensic_report", "forensic_report <user>", "LLM forensic report."),
     ("timeline_narrative", "timeline_narrative <user>", "LLM timeline story."),
     ("evidence", "evidence <user>", "LLM evidence extraction."),
+    ("llm_search", 'llm_search "<query>"', "Natural language semantic search."),
+    ("llm_threat", "llm_threat [user]", "LLM threat assessment."),
+    ("llm_bot", "llm_bot [user]", "Bot/automation detection."),
+    ("llm_profile", "llm_profile [user]", "Deep psychological/behavioral profile."),
+    ("llm_insider", "llm_insider [user]", "Insider threat analysis."),
+    ("llm_social", "llm_social [N]", "Social dynamics & group structure."),
+    ("llm_incident", "llm_incident [query]", "Incident timeline reconstruction."),
+    ("llm_topics", "llm_topics [N]", "Topic map across users."),
+    ("llm_sessions", "llm_sessions [user]", "Compare behavior across sessions."),
+    ("llm_baseline", "llm_baseline [user]", "Behavioral baseline & deviations."),
     # --- multi-log / export ---
     ("multi", "multi {add|list|clear|report}", "Multi-log aggregation."),
     ("aggregate", "aggregate", "Alias for multi report."),
@@ -4310,12 +4904,12 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   .tab-content{display:none;flex-direction:column;flex:1;overflow:hidden}
   .tab-content.active{display:flex}
   #messages{flex:1;overflow-y:auto;padding:6px 10px;font-size:13px;line-height:1.5}
-  #messages .msg{padding:2px 0;border-bottom:1px solid #001a00;animation:fadeIn .15s;display:flex;align-items:baseline;gap:4px;overflow:hidden}
+  #messages .msg{padding:2px 0;border-bottom:1px solid #001a00;animation:fadeIn .15s;display:flex;align-items:baseline;gap:4px}
   @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
   .ts{color:#060;white-space:nowrap;flex-shrink:0;font-size:11px}
   .user{color:#0f0;font-weight:bold;white-space:nowrap;flex-shrink:0;max-width:30%;overflow:hidden;text-overflow:ellipsis}
   .lvl{color:#0a0;white-space:nowrap;flex-shrink:0;max-width:20%;overflow:hidden;text-overflow:ellipsis}
-  .txt{color:#0c0;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .txt{color:#0c0;flex:1;min-width:0;white-space:pre-wrap;word-break:break-all}
   .highlight{background:#0f01;border-left:2px solid #0f0;padding-left:6px}
   .cmd{color:#ff0;font-weight:bold;border-left:2px solid #ff0;padding-left:6px;margin-top:4px}
   .out{color:#0f0;white-space:pre-wrap;padding-left:6px;margin-bottom:4px;border-left:2px solid #060}
@@ -4412,7 +5006,7 @@ function addEntry(e){
     const ts=document.createElement('span');ts.className='ts';ts.textContent=(e.ts||'').slice(0,19)+' ';
     const us=document.createElement('span');us.className='user';us.textContent=(e.user||'?')+' ';
     const lv=document.createElement('span');lv.className='lvl';lv.textContent=(e.level||e.event||'')?'['+(e.level||e.event||'')+'] ':'';
-    const tx=document.createElement('span');tx.className='txt';tx.textContent=(e.text||e.raw||'').slice(0,300);
+    const tx=document.createElement('span');tx.className='txt';tx.textContent=(e.text||e.raw||'');
     d.append(ts,us,lv,tx);
   }
   msg.append(d);
@@ -4432,7 +5026,7 @@ function addOutput(e){
     const ts=document.createElement('span');ts.className='ts';ts.textContent=(e.ts||'').slice(0,19)+' ';
     const us=document.createElement('span');us.className='user';us.textContent=(e.user||'?')+' ';
     const lv=document.createElement('span');lv.className='lvl';lv.textContent=(e.level||e.event||'')?'['+(e.level||e.event||'')+'] ':'';
-    const tx=document.createElement('span');tx.className='txt';tx.textContent=(e.text||e.raw||'').slice(0,300);
+    const tx=document.createElement('span');tx.className='txt';tx.textContent=(e.text||e.raw||'');
     d.append(ts,us,lv,tx);
   }
   output.append(d);
@@ -4465,7 +5059,7 @@ function renderMenu(data){
             'filters':['focus','target','since','until','view','ignore'],
             'interaction':['response_times','session_times','influence','sequences','rootcause','correlate'],
             'forensic':['entities','gaps','reconstruct','forensic_report','timeline_narrative','evidence'],
-            'llm':['analyze','ask','askall','interact','compare','compare-auto','tag','tagall','explain','summarize','cluster','auto_report','drift-explain'],
+            'llm':['analyze','ask','askall','interact','compare','compare-auto','tag','tagall','explain','summarize','cluster','auto_report','drift-explain','llm_search','llm_threat','llm_bot','llm_profile','llm_insider','llm_social','llm_incident','llm_topics','llm_sessions','llm_baseline'],
             'multi':['multi','aggregate','export_html','export_html_drilldown','export_sql','sql','save_profile','load_profile','compare_profiles'],
             'config':['settings','set','alias','note','load','reload','save_config','load_config','rules','web','webportal','webhook'],
             'system':['commands','help','quit','script','export','cron','dashboard','watch','watch_alert','alert_fatigue']};
@@ -4617,7 +5211,7 @@ class WebPortalHandler(BaseHTTPRequestHandler):
                     "target": e.target,
                     "level": e.level,
                     "event": e.event,
-                    "text": (e.text or e.raw)[:300],
+                    "text": e.text or e.raw,
                 })
             self._json_list(recent)
         elif parsed.path == "/api/dashboard":
@@ -5970,6 +6564,17 @@ class LogShell(cmd.Cmd):
             ("forensic_report", "forensic_report <user>", "LLM-powered comprehensive forensic report."),
             ("timeline_narrative", "timeline_narrative <user>", "LLM-generated narrative from timeline events."),
             ("evidence", "evidence <user>", "LLM-based structured evidence extraction."),
+            # Advanced LLM commands
+            ("llm_search", 'llm_search "<query>"', "Natural language semantic search across all logs."),
+            ("llm_threat", "llm_threat [user]", "LLM threat assessment (risk level, TTPs, indicators)."),
+            ("llm_bot", "llm_bot [user]", "Bot/automation detection with sophistication analysis."),
+            ("llm_profile", "llm_profile [user]", "Deep psychological/behavioral profile (Big Five, roles, motivations)."),
+            ("llm_insider", "llm_insider [user]", "Insider threat analysis (exfiltration, policy violations)."),
+            ("llm_social", "llm_social [N]", "Social dynamics: power structure, clusters, influence patterns."),
+            ("llm_incident", "llm_incident [query]", "Incident timeline reconstruction with LLM narrative."),
+            ("llm_topics", "llm_topics [N]", "Topic map: discussion topics and cross-user connections."),
+            ("llm_sessions", "llm_sessions [user]", "Compare user behavior across different sessions."),
+            ("llm_baseline", "llm_baseline [user]", "Establish behavioral baseline and flag deviations."),
             ("commands", "commands  (or ??)", "Print this reference."),
             ("help", "help [name]  (or ?<name>)", "Built-in help."),
             ("quit", "quit  (exit, Ctrl-D)", "Exit the shell."),
@@ -7405,6 +8010,94 @@ class LogShell(cmd.Cmd):
             self.state.max_chunk_chars, cache=self.state.llm_cache,
         )
 
+    # --- NEW LLM commands ----------------------------------------------------
+
+    def do_llm_search(self, arg: str) -> None:
+        """llm_search "<query>"   Natural language semantic search across all logs."""
+        if not arg.strip():
+            print('Usage: llm_search "<natural language query>"')
+            return
+        llm_search(self._active_entries(), arg.strip(),
+                   self.state.llm_url, self.state.llm_model,
+                   self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    def do_llm_threat(self, arg: str) -> None:
+        """llm_threat [user]   LLM threat assessment for a user."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        llm_threat_assessment(self.state.entries, user,
+                              self.state.llm_url, self.state.llm_model,
+                              self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    def do_llm_bot(self, arg: str) -> None:
+        """llm_bot [user]   LLM bot/automation detection for a user."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        llm_bot_detection(self.state.entries, user,
+                          self.state.llm_url, self.state.llm_model,
+                          self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    def do_llm_profile(self, arg: str) -> None:
+        """llm_profile [user]   Deep psychological/behavioral profile."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        llm_deep_profile(self.state.entries, user,
+                         self.state.llm_url, self.state.llm_model,
+                         self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    def do_llm_insider(self, arg: str) -> None:
+        """llm_insider [user]   Insider threat analysis (exfiltration, policy violations)."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        llm_insider_threat(self.state.entries, user,
+                           self.state.llm_url, self.state.llm_model,
+                           self.state.max_chunk_chars, cache=self.state.llm_cache)
+
+    def do_llm_social(self, arg: str) -> None:
+        """llm_social [N]   Social dynamics analysis (group structure, influence)."""
+        n = int(arg.strip()) if arg.strip().isdigit() else 15
+        llm_social_dynamics(self.state.entries, self.state.llm_url,
+                            self.state.llm_model, self.state.max_chunk_chars,
+                            cache=self.state.llm_cache, top_users=n)
+
+    def do_llm_incident(self, arg: str) -> None:
+        """llm_incident [query]   Incident timeline reconstruction with LLM narrative."""
+        llm_incident_timeline(self.state.entries, self.state.llm_url,
+                              self.state.llm_model, self.state.max_chunk_chars,
+                              cache=self.state.llm_cache, query=arg.strip())
+
+    def do_llm_topics(self, arg: str) -> None:
+        """llm_topics [N]   Topic map: what users discuss and how topics connect."""
+        n = int(arg.strip()) if arg.strip().isdigit() else 10
+        llm_topic_map(self.state.entries, self.state.llm_url,
+                      self.state.llm_model, self.state.max_chunk_chars,
+                      cache=self.state.llm_cache, top_users=n)
+
+    def do_llm_sessions(self, arg: str) -> None:
+        """llm_sessions [user] [gap_min]   Compare user behavior across sessions."""
+        parts = self._split(arg)
+        user = parts[0] if parts else self.state.focused_user
+        gap = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 60
+        user = self._resolve_user(user or "")
+        if not user:
+            return
+        llm_compare_sessions(self.state.entries, user, self.state.llm_url,
+                             self.state.llm_model, self.state.max_chunk_chars,
+                             cache=self.state.llm_cache, gap_minutes=gap)
+
+    def do_llm_baseline(self, arg: str) -> None:
+        """llm_baseline [user]   Establish behavioral baseline and flag deviations."""
+        user = self._resolve_user(arg)
+        if not user:
+            return
+        llm_baseline(self.state.entries, user, self.state.llm_url,
+                     self.state.llm_model, self.state.max_chunk_chars,
+                     cache=self.state.llm_cache)
+
     # --- tab completion ------------------------------------------------------
 
     def complete_user(self, text, line, begidx, endidx):
@@ -7637,6 +8330,26 @@ class LogShell(cmd.Cmd):
         return self._complete_prefix(text, self._nicks())
     def complete_evidence(self, text, line, begidx, endidx):
         return self._complete_prefix(text, self._nicks())
+    def complete_llm_search(self, text, line, begidx, endidx):
+        return []
+    def complete_llm_threat(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_bot(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_profile(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_insider(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_social(self, text, line, begidx, endidx):
+        return []
+    def complete_llm_incident(self, text, line, begidx, endidx):
+        return []
+    def complete_llm_topics(self, text, line, begidx, endidx):
+        return []
+    def complete_llm_sessions(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
+    def complete_llm_baseline(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, self._nicks())
 
 
 # ---------- main -------------------------------------------------------------
@@ -7770,6 +8483,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--forensic-report", help="With --batch, generate LLM forensic report for user")
     p.add_argument("--timeline-narrative", help="With --batch, LLM timeline narrative for user")
     p.add_argument("--evidence", help="With --batch, LLM evidence extraction for user")
+    # Advanced LLM CLI flags
+    p.add_argument("--llm-search", help="With --batch, natural language semantic search query")
+    p.add_argument("--llm-threat", help="With --batch, threat assessment for user")
+    p.add_argument("--llm-bot", help="With --batch, bot detection for user")
+    p.add_argument("--llm-profile", help="With --batch, deep behavioral profile for user")
+    p.add_argument("--llm-insider", help="With --batch, insider threat analysis for user")
+    p.add_argument("--llm-social", type=int, nargs="?", const=15, default=0,
+                   help="With --batch, social dynamics analysis (optional top N users)")
+    p.add_argument("--llm-incident", nargs="?", const="", default=None,
+                   help="With --batch, incident timeline reconstruction (optional query)")
+    p.add_argument("--llm-topics", type=int, nargs="?", const=10, default=0,
+                   help="With --batch, topic map analysis (optional top N users)")
+    p.add_argument("--llm-sessions", nargs=2, metavar=("USER", "GAP"),
+                   help="With --batch, compare sessions: --llm-sessions user 60")
+    p.add_argument("--llm-baseline", help="With --batch, behavioral baseline for user")
     args = p.parse_args(argv)
 
     since = parse_iso_arg(args.since) if args.since else None
@@ -8180,6 +8908,57 @@ def main(argv: list[str] | None = None) -> int:
         if args.evidence:
             llm_evidence_extraction(active, args.evidence, args.llm_url, args.llm_model,
                                     args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_search:
+            llm_search(active, args.llm_search, args.llm_url, args.llm_model,
+                       args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_threat:
+            llm_threat_assessment(active, args.llm_threat, args.llm_url, args.llm_model,
+                                  args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_bot:
+            llm_bot_detection(active, args.llm_bot, args.llm_url, args.llm_model,
+                              args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_profile:
+            llm_deep_profile(active, args.llm_profile, args.llm_url, args.llm_model,
+                             args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_insider:
+            llm_insider_threat(active, args.llm_insider, args.llm_url, args.llm_model,
+                               args.max_chunk_chars, cache=cache)
+            return 0
+
+        if args.llm_social:
+            llm_social_dynamics(active, args.llm_url, args.llm_model,
+                                args.max_chunk_chars, cache=cache, top_users=args.llm_social)
+            return 0
+
+        if args.llm_incident is not None:
+            llm_incident_timeline(active, args.llm_url, args.llm_model,
+                                  args.max_chunk_chars, cache=cache, query=args.llm_incident)
+            return 0
+
+        if args.llm_topics:
+            llm_topic_map(active, args.llm_url, args.llm_model,
+                          args.max_chunk_chars, cache=cache, top_users=args.llm_topics)
+            return 0
+
+        if args.llm_sessions:
+            user, gap_s = args.llm_sessions
+            llm_compare_sessions(active, user, args.llm_url, args.llm_model,
+                                 args.max_chunk_chars, cache=cache, gap_minutes=int(gap_s))
+            return 0
+
+        if args.llm_baseline:
+            llm_baseline(active, args.llm_baseline, args.llm_url, args.llm_model,
+                         args.max_chunk_chars, cache=cache)
             return 0
 
         if args.similar:
