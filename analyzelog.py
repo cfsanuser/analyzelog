@@ -1358,6 +1358,317 @@ def print_timeline_reconstruction(timeline: list[TimelineEvent],
                 if vals:
                     print(f"          {etype}: {', '.join(vals[:3])}")
 
+# ---------- Log tamper detection (#28) ----------------------------------------
+
+@dataclass
+class TamperIndicator:
+    severity: str  # "critical", "high", "medium", "low", "info"
+    category: str  # "timestamp", "sequence", "content", "format", "statistical"
+    description: str
+    details: str
+    line_numbers: list[int] = field(default_factory=list)
+    affected_entries: list[Entry] = field(default_factory=list)
+
+@dataclass
+class TamperReport:
+    total_entries: int
+    analyzed_entries: int
+    indicators: list[TamperIndicator]
+    integrity_score: float  # 0.0 (heavily tampered) to 1.0 (clean)
+    summary: str
+
+def detect_tampering(entries: list[Entry], user: str | None = None,
+                     strict_mode: bool = False) -> TamperReport:
+    """Detect signs of log manipulation: out-of-order timestamps, duplicate entries,
+    impossible gaps, format inconsistencies, content anomalies, and statistical irregularities."""
+    filtered = [e for e in entries if line_matches_user(e, user)] if user else entries
+    indicators: list[TamperIndicator] = []
+    analyzed = 0
+
+    # 1. Timestamp order analysis
+    ts_entries = [(i, e) for i, e in enumerate(filtered) if e.ts]
+    if len(ts_entries) >= 2:
+        analyzed += len(ts_entries)
+        out_of_order: list[tuple[int, Entry, Entry]] = []
+        for i in range(1, len(ts_entries)):
+            prev_idx, prev_e = ts_entries[i - 1]
+            curr_idx, curr_e = ts_entries[i]
+            if curr_e.ts < prev_e.ts:
+                out_of_order.append((curr_idx, prev_e, curr_e))
+
+        if out_of_order:
+            severity = "critical" if len(out_of_order) > 5 else "high" if len(out_of_order) > 1 else "medium"
+            indicators.append(TamperIndicator(
+                severity=severity,
+                category="timestamp",
+                description=f"Out-of-order timestamps detected ({len(out_of_order)} occurrences)",
+                details=f"Entries found with timestamps earlier than preceding entries. "
+                        f"First occurrence: line {out_of_order[0][0]+1} "
+                        f"({out_of_order[0][2].ts} < {out_of_order[0][1].ts})",
+                line_numbers=[idx + 1 for idx, _, _ in out_of_order[:20]],
+            ))
+
+        # 2. Duplicate timestamp detection
+        ts_counts: Counter = Counter()
+        ts_first_seen: dict[datetime, int] = {}
+        for idx, e in ts_entries:
+            ts_counts[e.ts] += 1
+            if e.ts not in ts_first_seen:
+                ts_first_seen[e.ts] = idx
+        dup_ts = [(ts, cnt) for ts, cnt in ts_counts.items() if cnt > 1]
+        if dup_ts:
+            max_dup = max(cnt for _, cnt in dup_ts)
+            severity = "high" if max_dup > 10 else "medium" if max_dup > 3 else "low"
+            indicators.append(TamperIndicator(
+                severity=severity,
+                category="timestamp",
+                description=f"Duplicate timestamps ({len(dup_ts)} unique timestamps repeated)",
+                details=f"Max duplicates for single timestamp: {max_dup}. "
+                        f"Example: {dup_ts[0][0]} appears {dup_ts[0][1]} times",
+            ))
+
+        # 3. Impossible time gaps (negative or zero gaps in sorted order)
+        sorted_ts = sorted(ts_entries, key=lambda x: x[1].ts)
+        zero_gaps = []
+        for i in range(1, len(sorted_ts)):
+            prev_ts = sorted_ts[i - 1][1].ts
+            curr_ts = sorted_ts[i][1].ts
+            if prev_ts == curr_ts:
+                zero_gaps.append(sorted_ts[i][0])
+        if zero_gaps and strict_mode:
+            indicators.append(TamperIndicator(
+                severity="medium",
+                category="timestamp",
+                description=f"Zero-duration gaps ({len(zero_gaps)} entries with identical timestamps)",
+                details=f"Multiple entries share exact timestamps, which may indicate batch insertion or copy-paste",
+                line_numbers=[idx + 1 for idx in zero_gaps[:10]],
+            ))
+
+    # 4. Format consistency analysis
+    format_sequence = [e.fmt for e in filtered]
+    format_changes = []
+    for i in range(1, len(format_sequence)):
+        if format_sequence[i] != format_sequence[i - 1]:
+            format_changes.append((i, format_sequence[i - 1], format_sequence[i]))
+    if format_changes:
+        # Check if format changes are clustered (suspicious) vs gradual (normal)
+        change_positions = [fc[0] for fc in format_changes]
+        if len(change_positions) >= 2:
+            gaps_between_changes = [change_positions[i+1] - change_positions[i]
+                                    for i in range(len(change_positions)-1)]
+            avg_gap = statistics.mean(gaps_between_changes) if gaps_between_changes else 0
+            if avg_gap < 5 and len(format_changes) > 3:
+                indicators.append(TamperIndicator(
+                    severity="high",
+                    category="format",
+                    description=f"Rapid format changes ({len(format_changes)} changes in close proximity)",
+                    details=f"Average distance between format changes: {avg_gap:.1f} entries. "
+                            f"Sudden format shifts may indicate log splicing or injection",
+                    line_numbers=[pos + 1 for pos in change_positions[:10]],
+                ))
+            else:
+                indicators.append(TamperIndicator(
+                    severity="info",
+                    category="format",
+                    description=f"Format transitions detected ({len(format_changes)} changes)",
+                    details=f"Formats: {dict(Counter(format_sequence))}. "
+                            f"Changes appear gradual, likely normal log source variation",
+                ))
+
+    # 5. Content duplication analysis (copy-paste detection)
+    raw_lines = [e.raw for e in filtered]
+    line_counts = Counter(raw_lines)
+    exact_dups = [(line, cnt) for line, cnt in line_counts.items() if cnt > 1]
+    if exact_dups:
+        max_dup_line = max(cnt for _, cnt in exact_dups)
+        if max_dup_line > 5 or (strict_mode and max_dup_line > 2):
+            severity = "high" if max_dup_line > 20 else "medium"
+            indicators.append(TamperIndicator(
+                severity=severity,
+                category="content",
+                description=f"Exact duplicate lines ({len(exact_dups)} unique lines repeated)",
+                details=f"Most repeated line appears {max_dup_line} times. "
+                        f"Sample: '{exact_dups[0][0][:100]}...'",
+            ))
+
+    # 6. Shannon entropy analysis on message content
+    if filtered:
+        texts = [e.text or e.raw for e in filtered if e.text or e.raw]
+        if len(texts) >= 10:
+            entropies = []
+            for text in texts:
+                if len(text) > 0:
+                    freq = Counter(text)
+                    length = len(text)
+                    entropy = -sum((c / length) * math.log2(c / length) for c in freq.values())
+                    entropies.append(entropy)
+            if entropies:
+                mean_entropy = statistics.mean(entropies)
+                stdev_entropy = statistics.pstdev(entropies) if len(entropies) > 1 else 0
+                # Flag entries with unusually low or high entropy
+                low_entropy_entries = []
+                high_entropy_entries = []
+                for i, (e, ent) in enumerate(zip(filtered, entropies)):
+                    if stdev_entropy > 0:
+                        z = (ent - mean_entropy) / stdev_entropy
+                        if z < -2.5:
+                            low_entropy_entries.append((i, e, ent))
+                        elif z > 2.5:
+                            high_entropy_entries.append((i, e, ent))
+                if low_entropy_entries:
+                    indicators.append(TamperIndicator(
+                        severity="medium",
+                        category="content",
+                        description=f"Low-entropy entries detected ({len(low_entropy_entries)} entries)",
+                        details=f"Unusually repetitive/predictable content (z < -2.5σ). "
+                                f"May indicate automated generation or padding. "
+                                f"Mean entropy: {mean_entropy:.2f}, threshold: {mean_entropy - 2.5*stdev_entropy:.2f}",
+                        line_numbers=[idx + 1 for idx, _, _ in low_entropy_entries[:10]],
+                    ))
+                if high_entropy_entries and strict_mode:
+                    indicators.append(TamperIndicator(
+                        severity="low",
+                        category="content",
+                        description=f"High-entropy entries ({len(high_entropy_entries)} entries)",
+                        details=f"Unusually random-looking content (z > 2.5σ). "
+                                f"May indicate encrypted data, hashes, or noise injection",
+                        line_numbers=[idx + 1 for idx, _, _ in high_entropy_entries[:10]],
+                    ))
+
+    # 7. Statistical density analysis (sudden spikes/drops in entry rate)
+    if ts_entries and len(ts_entries) >= 10:
+        sorted_by_time = sorted(ts_entries, key=lambda x: x[1].ts)
+        # Divide into buckets and check for anomalous density changes
+        total_span = (sorted_by_time[-1][1].ts - sorted_by_time[0][1].ts).total_seconds()
+        if total_span > 0:
+            num_buckets = min(len(sorted_by_time) // 5, 50)
+            bucket_size = total_span / num_buckets
+            buckets: list[int] = [0] * num_buckets
+            for idx, e in sorted_by_time:
+                bucket_idx = int((e.ts - sorted_by_time[0][1].ts).total_seconds() / bucket_size)
+                bucket_idx = min(bucket_idx, num_buckets - 1)
+                buckets[bucket_idx] += 1
+            if len(buckets) >= 3:
+                mean_bucket = statistics.mean(buckets)
+                stdev_bucket = statistics.pstdev(buckets) if len(buckets) > 1 else 0
+                if stdev_bucket > 0:
+                    anomalous_buckets = []
+                    for i, count in enumerate(buckets):
+                        z = (count - mean_bucket) / stdev_bucket
+                        if abs(z) > 3.0:
+                            anomalous_buckets.append((i, count, z))
+                    if anomalous_buckets:
+                        severity = "high" if len(anomalous_buckets) > 3 else "medium"
+                        indicators.append(TamperIndicator(
+                            severity=severity,
+                            category="statistical",
+                            description=f"Anomalous entry density ({len(anomalous_buckets)} buckets with z > 3σ)",
+                            details=f"Entry rate varies significantly from expected distribution. "
+                                    f"Mean entries/bucket: {mean_bucket:.1f}, "
+                                    f"Anomalous buckets: {[(i, cnt, f'{z:+.1f}σ') for i, cnt, z in anomalous_buckets[:5]]}",
+                        ))
+
+    # 8. Sequence number gaps (if entries contain sequential IDs)
+    seq_pattern = re.compile(r'(?:seq(?:uence)?[\s:=]*|id[\s:=]*|#[\s:]*)(\d+)', re.I)
+    seq_numbers: list[tuple[int, int, Entry]] = []
+    for i, e in enumerate(filtered):
+        m = seq_pattern.search(e.raw)
+        if m:
+            try:
+                seq_numbers.append((i, int(m.group(1)), e))
+            except ValueError:
+                pass
+    if len(seq_numbers) >= 5:
+        seq_numbers.sort(key=lambda x: x[1])
+        gaps_in_seq = []
+        for i in range(1, len(seq_numbers)):
+            prev_num = seq_numbers[i - 1][1]
+            curr_num = seq_numbers[i][1]
+            if curr_num - prev_num > 1:
+                gaps_in_seq.append((seq_numbers[i][0], prev_num, curr_num, curr_num - prev_num))
+        if gaps_in_seq:
+            max_gap = max(g[3] for g in gaps_in_seq)
+            severity = "high" if max_gap > 100 else "medium" if max_gap > 10 else "low"
+            indicators.append(TamperIndicator(
+                severity=severity,
+                category="sequence",
+                description=f"Sequence number gaps detected ({len(gaps_in_seq)} gaps)",
+                details=f"Missing sequence numbers suggest deleted entries. "
+                        f"Largest gap: {gaps_in_seq[0][2]} - {gaps_in_seq[0][1]} = {gaps_in_seq[0][3]} missing",
+                line_numbers=[idx + 1 for idx, _, _, _ in gaps_in_seq[:10]],
+            ))
+
+    # Calculate integrity score
+    severity_weights = {"critical": 1.0, "high": 0.7, "medium": 0.4, "low": 0.2, "info": 0.0}
+    total_penalty = sum(severity_weights.get(ind.severity, 0) for ind in indicators)
+    integrity_score = max(0.0, min(1.0, 1.0 - (total_penalty / 5.0)))
+
+    # Generate summary
+    critical_count = sum(1 for ind in indicators if ind.severity == "critical")
+    high_count = sum(1 for ind in indicators if ind.severity == "high")
+    if critical_count > 0:
+        summary = f"CRITICAL: {critical_count} critical indicators suggest significant tampering"
+    elif high_count > 0:
+        summary = f"WARNING: {high_count} high-severity indicators suggest possible manipulation"
+    elif indicators:
+        summary = f"CAUTION: {len(indicators)} minor indicators detected; review recommended"
+    else:
+        summary = "CLEAN: No tampering indicators detected"
+
+    return TamperReport(
+        total_entries=len(entries),
+        analyzed=analyzed or len(filtered),
+        indicators=indicators,
+        integrity_score=integrity_score,
+        summary=summary,
+    )
+
+
+def print_tamper_report(report: TamperReport, user: str | None = None) -> None:
+    """Print a formatted tamper detection report."""
+    label = f" for '{user}'" if user else ""
+    print(f"\n{'='*70}")
+    print(f"LOG TAMPER DETECTION REPORT{label}")
+    print(f"{'='*70}")
+    print(f"  Total entries:       {report.total_entries}")
+    print(f"  Analyzed entries:    {report.analyzed}")
+    print(f"  Integrity score:     {report.integrity_score:.2f} / 1.00")
+    print(f"  Indicators found:    {len(report.indicators)}")
+    print(f"\n  {report.summary}")
+    print(f"{'='*70}")
+
+    if not report.indicators:
+        print(f"\n  ✓ No signs of tampering detected")
+        return
+
+    # Group by severity
+    by_severity: dict[str, list[TamperIndicator]] = {}
+    for ind in report.indicators:
+        by_severity.setdefault(ind.severity, []).append(ind)
+
+    for severity in ("critical", "high", "medium", "low", "info"):
+        if severity not in by_severity:
+            continue
+        indicators = by_severity[severity]
+        severity_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "ℹ️"}.get(severity, "•")
+        print(f"\n  [{severity_icon}] {severity.upper()} ({len(indicators)} indicators)")
+        for ind in indicators:
+            print(f"    [{ind.category}] {ind.description}")
+            print(f"      {ind.details}")
+            if ind.line_numbers:
+                print(f"      Affected lines: {', '.join(str(ln) for ln in ind.line_numbers[:8])}"
+                      f"{'...' if len(ind.line_numbers) > 8 else ''}")
+
+    print(f"\n{'='*70}")
+    if report.integrity_score < 0.5:
+        print(f"  ⚠ RECOMMENDATION: Log integrity is compromised. Investigate immediately.")
+    elif report.integrity_score < 0.8:
+        print(f"  ⚠ RECOMMENDATION: Review flagged indicators and correlate with other evidence.")
+    else:
+        print(f"  ✓ Log integrity appears intact. Continue normal monitoring.")
+    print(f"{'='*70}\n")
+
+
 # ---------- NEW: Sequence mining (#14) ----------------------------------------
 
 @dataclass
@@ -5574,6 +5885,7 @@ PORTAL_COMMANDS: list[tuple[str, str, str]] = [
     ("forensic_report", "forensic_report <user>", "LLM forensic report."),
     ("timeline_narrative", "timeline_narrative <user>", "LLM timeline story."),
     ("evidence", "evidence <user>", "LLM evidence extraction."),
+    ("tamper_detect", "tamper_detect [user] [--strict]", "Detect log tampering/manipulation."),
     ("llm_search", 'llm_search "<query>"', "Natural language semantic search."),
     ("llm_threat", "llm_threat [user]", "LLM threat assessment."),
     ("llm_bot", "llm_bot [user]", "Bot/automation detection."),
@@ -5816,7 +6128,7 @@ function renderMenu(data){
             'viewing':['show','pick','inspect','last','info','grep','search','timeline','heatmap','net','dataframe','template_filter','prometheus'],
             'filters':['focus','target','since','until','view','ignore'],
             'interaction':['response_times','session_times','influence','sequences','rootcause','correlate'],
-            'forensic':['entities','gaps','reconstruct','forensic_report','timeline_narrative','evidence'],
+            'forensic':['entities','gaps','reconstruct','forensic_report','timeline_narrative','evidence','tamper_detect'],
             'llm':['analyze','ask','askall','interact','compare','compare-auto','tag','tagall','explain','summarize','cluster','auto_report','drift-explain','llm_search','llm_threat','llm_bot','llm_profile','llm_insider','llm_social','llm_incident','llm_topics','llm_sessions','llm_baseline','llm_summary','llm_replay','llm_predict','llm_motive','llm_relationship','llm_audit','llm_risk'],
             'multi':['multi','aggregate','export_html','export_html_drilldown','export_sql','sql','save_profile','load_profile','compare_profiles'],
             'config':['config','settings','set','alias','note','load','reload','save_config','load_config','rules','web','webportal','webhook'],
@@ -7620,6 +7932,7 @@ class LogShell(cmd.Cmd):
             ("forensic_report", "forensic_report <user>", "LLM-powered comprehensive forensic report."),
             ("timeline_narrative", "timeline_narrative <user>", "LLM-generated narrative from timeline events."),
             ("evidence", "evidence <user>", "LLM-based structured evidence extraction."),
+            ("tamper_detect", "tamper_detect [user] [--strict]", "Detect log tampering (timestamps, duplicates, entropy, sequence gaps)."),
             # Advanced LLM commands
             ("llm_search", 'llm_search "<query>"', "Natural language semantic search across all logs."),
             ("llm_threat", "llm_threat [user]", "LLM threat assessment (risk level, TTPs, indicators)."),
@@ -9085,6 +9398,24 @@ class LogShell(cmd.Cmd):
             self.state.max_chunk_chars, cache=self.state.llm_cache,
         )
 
+    def do_tamper_detect(self, arg: str) -> None:
+        """tamper_detect [user] [--strict]   Detect signs of log manipulation."""
+        parts = self._split(arg)
+        user = None
+        strict = False
+        for p in parts:
+            if p == "--strict":
+                strict = True
+            elif not p.startswith("--"):
+                user = p
+        user = self._resolve_user(user or "") if user else None
+        entries = self._filtered(user) if user else self._active_entries()
+        if not entries:
+            print("(no data)")
+            return
+        report = detect_tampering(entries, user, strict_mode=strict)
+        print_tamper_report(report, user)
+
     # --- NEW LLM commands ----------------------------------------------------
 
     def do_llm_search(self, arg: str) -> None:
@@ -9579,6 +9910,11 @@ class LogShell(cmd.Cmd):
         return self._complete_prefix(text, self._nicks())
     def complete_evidence(self, text, line, begidx, endidx):
         return self._complete_prefix(text, self._nicks())
+    def complete_tamper_detect(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, self._nicks() + ["--strict"])
+        return []
     def complete_llm_search(self, text, line, begidx, endidx):
         return []
     def complete_llm_threat(self, text, line, begidx, endidx):
@@ -9812,6 +10148,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--last-seen", nargs="?", const=True, default=None,
                    help="With --batch, last seen times (optional user)")
     p.add_argument("--whois", help="With --batch, one-command user dump")
+    p.add_argument("--tamper-detect", nargs="?", const=True, default=None,
+                   help="With --batch, detect log tampering (optional user, --strict for stricter checks)")
     p.add_argument("--diff-time", nargs=2, metavar=("SINCE", "UNTIL"),
                    help="With --batch, compare two time periods")
     p.add_argument("--top-words", type=int, nargs="?", const=50, default=0,
@@ -10370,6 +10708,14 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.whois:
             whois(active, args.whois)
+            return 0
+
+        if args.tamper_detect is not None:
+            user = args.tamper_detect if isinstance(args.tamper_detect, str) else args.user
+            strict = "--strict" in (sys.argv if sys.argv else [])
+            entries_for_tamper = [e for e in active if line_matches_user(e, user)] if user else active
+            report = detect_tampering(entries_for_tamper, user, strict_mode=strict)
+            print_tamper_report(report, user)
             return 0
 
         if args.diff_time:
