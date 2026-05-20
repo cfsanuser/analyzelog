@@ -3069,12 +3069,43 @@ def save_shell_config(state: "ShellState") -> None:
         "ignore_set": sorted(state.ignore_set),
         "aliases": state.aliases,
         "notes": state.notes,
+        "presets": state.presets,
+        "advanced": {
+            "default_z_threshold": state.default_z_threshold,
+            "default_anomaly_window": state.default_anomaly_window,
+            "default_forecast_days": state.default_forecast_days,
+            "default_burst_window": state.default_burst_window,
+            "default_burst_z": state.default_burst_z,
+            "default_session_gap": state.default_session_gap,
+            "default_response_window": state.default_response_window,
+            "output_format": state.output_format,
+            "command_timing": state.command_timing,
+            "debug_mode": state.debug_mode,
+            "quiet_mode": state.quiet_mode,
+            "default_export_dir": state.default_export_dir,
+            "score_flag_threshold": state.score_flag_threshold,
+            "max_output_lines": state.max_output_lines,
+        },
     }
     for rule in state.alert_engine.rules:
         data["rules"].append({
             "name": rule.name, "field": rule.field, "op": rule.op,
             "value": rule.value, "message": rule.message, "enabled": rule.enabled,
         })
+    if state.case_store:
+        data["cases"] = {"_counter": state.case_store._counter, "cases": {}}
+        for cid, c in state.case_store.cases.items():
+            data["cases"]["cases"][cid] = {
+                "name": c.name, "description": c.description, "status": c.status,
+                "priority": c.priority, "created": c.created, "updated": c.updated,
+                "tags": c.tags, "assigned_to": c.assigned_to,
+                "findings": [
+                    {"id": f.id, "entry_id": f.entry_id, "user": f.user,
+                     "evidence_text": f.evidence_text, "category": f.category,
+                     "severity": f.severity, "note": f.note, "ts_added": f.ts_added}
+                    for f in c.findings
+                ],
+            }
     try:
         with open(_SHELL_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
@@ -3103,6 +3134,29 @@ def load_shell_config(state: "ShellState") -> None:
     state.ignore_set.update(data.get("ignore_set", []))
     state.aliases.update(data.get("aliases", {}))
     state.notes.update(data.get("notes", {}))
+    if "presets" in data:
+        state.presets.update(data["presets"])
+    if "advanced" in data:
+        adv = data["advanced"]
+        for key in ("default_z_threshold", "default_anomaly_window", "default_forecast_days",
+                    "default_burst_window", "default_burst_z", "default_session_gap",
+                    "default_response_window", "output_format", "command_timing",
+                    "debug_mode", "quiet_mode", "default_export_dir", "score_flag_threshold",
+                    "max_output_lines"):
+            if key in adv:
+                setattr(state, key, adv[key])
+    if state.case_store and "cases" in data:
+        cdata = data["cases"]
+        state.case_store._counter = cdata.get("_counter", 0)
+        for cid, cd in cdata.get("cases", {}).items():
+            findings = [CaseFinding(**fd) for fd in cd.get("findings", [])]
+            state.case_store.cases[cid] = Case(
+                id=cid, name=cd["name"], description=cd.get("description", ""),
+                status=cd.get("status", "open"), priority=cd.get("priority", "medium"),
+                created=cd.get("created", ""), updated=cd.get("updated", ""),
+                tags=cd.get("tags", []), findings=findings,
+                assigned_to=cd.get("assigned_to", ""),
+            )
 
 
 # ---------- views (named filter sets) ---------------------------------------
@@ -5940,8 +5994,10 @@ PORTAL_COMMANDS: list[tuple[str, str, str]] = [
     ("load_config", "load_config", "Reload config from disk."),
     ("commands", "commands", "Print this reference."),
     ("help", "help [name]", "Built-in help."),
-    ("quit", "quit", "Exit the shell."),
-]
+            ("quit", "quit", "Exit the shell."),
+            ("case", "case {create|list|show|add|...}", "Manage investigation cases."),
+            ("future_diag", "future_diag [user] [--auto-case]", "Predictive diagnostics and forecasting."),
+        ]
 
 _PORTAL_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -6132,8 +6188,9 @@ function renderMenu(data){
             'llm':['analyze','ask','askall','interact','compare','compare-auto','tag','tagall','explain','summarize','cluster','auto_report','drift-explain','llm_search','llm_threat','llm_bot','llm_profile','llm_insider','llm_social','llm_incident','llm_topics','llm_sessions','llm_baseline','llm_summary','llm_replay','llm_predict','llm_motive','llm_relationship','llm_audit','llm_risk'],
             'multi':['multi','aggregate','export_html','export_html_drilldown','export_sql','sql','save_profile','load_profile','compare_profiles'],
             'config':['config','settings','set','alias','note','load','reload','save_config','load_config','rules','web','webportal','webhook'],
+            'case':['case'],
             'system':['commands','help','quit','script','export','cron','dashboard','watch','watch_alert','alert_fatigue']};
-  var catLabel={'nav':'navigation','analysis':'analysis','viewing':'viewing','filters':'filters','interaction':'interaction','forensic':'forensic','llm':'llm','multi':'multi-log / export','config':'config','system':'system'};
+  var catLabel={'nav':'navigation','analysis':'analysis','viewing':'viewing','filters':'filters','interaction':'interaction','forensic':'forensic','llm':'llm','multi':'multi-log / export','config':'config','case':'case management','system':'system'};
   var done={};
   for(var ci=0;ci<order.length;ci++){
     var g=order[ci];var items=cats[g];
@@ -6578,6 +6635,27 @@ class ShellState:
     template_filter: str = ""
     saved_profiles: dict[str, str] = field(default_factory=dict)
     portal_server: "HTTPServer | None" = None
+    case_store: "CaseStore | None" = None
+    # Advanced user settings:
+    default_z_threshold: float = 2.5
+    default_anomaly_window: int = 14
+    default_forecast_days: int = 30
+    default_burst_window: int = 60
+    default_burst_z: float = 3.0
+    default_session_gap: int = 30
+    default_response_window: int = 300
+    output_format: str = "table"
+    command_timing: bool = False
+    debug_mode: bool = False
+    quiet_mode: bool = False
+    default_export_dir: str = ""
+    score_flag_threshold: float = 0.8
+    macro_recording: bool = False
+    macro_buffer: list[str] = field(default_factory=list)
+    presets: dict[str, dict[str, Any]] = field(default_factory=dict)
+    command_times: dict[str, list[float]] = field(default_factory=dict)
+    max_output_lines: int = 500
+    auto_refresh_interval: float = 0.0
 
 
 class LogShell(cmd.Cmd):
@@ -6763,6 +6841,15 @@ class LogShell(cmd.Cmd):
         if not line:
             return super().onecmd(line)
 
+        # Macro recording: capture non-macro commands
+        if self.state.macro_recording and not line.startswith("macro "):
+            self.state.macro_buffer.append(line)
+
+        # Command timing: measure execution time
+        import time
+        cmd_start = time.perf_counter()
+        head_token = line.split()[0] if line.split() else ""
+
         # ?? → commands
         if line == "??":
             line = "commands"
@@ -6792,7 +6879,6 @@ class LogShell(cmd.Cmd):
             redirect = (path, "a" if op == ">>" else "w")
 
         # Real-time commands bypass capture (so foreground watch streams)
-        head_token = line.split()[0] if line.split() else ""
         if head_token in self.NO_CAPTURE_CMDS:
             return super().onecmd(line)
 
@@ -6802,10 +6888,24 @@ class LogShell(cmd.Cmd):
             try:
                 result = super().onecmd(line)
             except Exception as exc:  # noqa: BLE001
+                if self.state.debug_mode:
+                    import traceback
+                    traceback.print_exc()
                 print(f"Error: {exc}")
                 result = False
         output = buf.getvalue()
         self.state.last_output = output
+
+        # Command timing: record and display
+        cmd_elapsed = time.perf_counter() - cmd_start
+        if self.state.command_timing:
+            if head_token not in self.state.command_times:
+                self.state.command_times[head_token] = []
+            self.state.command_times[head_token].append(cmd_elapsed)
+            # Keep only last 50 runs per command
+            if len(self.state.command_times[head_token]) > 50:
+                self.state.command_times[head_token] = self.state.command_times[head_token][-50:]
+            sys.stdout.write(f"[{cmd_elapsed:.3f}s] ")
 
         if redirect:
             path, mode = redirect
@@ -7966,6 +8066,25 @@ class LogShell(cmd.Cmd):
             ("commands", "commands  (or ??)", "Print this reference."),
             ("help", "help [name]  (or ?<name>)", "Built-in help."),
             ("quit", "quit  (exit, Ctrl-D)", "Exit the shell."),
+            # Case management
+            ("case", "case {create|list|show|add|...}", "Manage investigation cases and findings."),
+            # Future diagnostics
+            ("future_diag", "future_diag [user] [--lookback N] [--forecast N] [--auto-case] [--json]",
+             "Predictive diagnostics: health, warnings, degradation, risk trajectories, scenarios."),
+            # Advanced settings & commands
+            ("preset", "preset {list|save|load|delete|show|apply} [name]", "Manage analysis presets (saved parameter sets)."),
+            ("macro", "macro {record|stop|play|list|delete|show} [name]", "Record and replay command sequences."),
+            ("timing", "timing [on|off]", "Toggle command execution timing display."),
+            ("debug", "debug [on|off]", "Toggle debug mode (verbose error traces)."),
+            ("quiet", "quiet [on|off]", "Toggle quiet mode (suppress non-essential output)."),
+            ("env", "env", "Show environment and system information."),
+            ("memory", "memory", "Show memory usage breakdown."),
+            ("reset", "reset [all|filters|settings|aliases|notes|ignore]", "Reset configuration to defaults."),
+            ("export_config", "export_config <path>", "Export all configuration to a portable JSON file."),
+            ("import_config", "import_config <path>", "Import configuration from a portable JSON file."),
+            ("benchmark", "benchmark [N]", "Run performance benchmarks (default N=1000 entries)."),
+            ("set_default", "set_default <key> <value>", "Set advanced default parameters."),
+            ("show_defaults", "show_defaults", "Display all advanced default parameters."),
         ]
         usage_w = min(max(len(u) for _, u, _ in ref), 70)
         print(f"\n  {'COMMAND'.ljust(usage_w)}   DESCRIPTION")
@@ -9087,6 +9206,500 @@ class LogShell(cmd.Cmd):
         load_shell_config(self.state)
         print(f"Config loaded from {_SHELL_CONFIG_PATH}")
 
+    # --- advanced settings & commands ----------------------------------------
+
+    def do_preset(self, arg: str) -> None:
+        """preset   Manage analysis presets (saved parameter sets).
+
+        preset list
+        preset save <name> [--desc "..."]
+        preset load <name>
+        preset delete <name>
+        preset show <name>
+        preset apply <name>   Apply preset and run current command context
+        """
+        parts = self._split(arg)
+        if not parts:
+            self.do_preset("list")
+            return
+        sub = parts[0].lower()
+        if sub == "list":
+            if not self.state.presets:
+                print("(no presets)")
+                return
+            print("  Presets:")
+            for name, p in sorted(self.state.presets.items()):
+                desc = p.get("desc", "")
+                keys = ", ".join(k for k in p if k != "desc")
+                print(f"    {name:<20s}  {desc or keys}")
+        elif sub == "save":
+            if len(parts) < 2:
+                print("Usage: preset save <name> [--desc ...]")
+                return
+            name = parts[1]
+            desc = ""
+            i = 2
+            while i < len(parts):
+                if parts[i] == "--desc" and i + 1 < len(parts):
+                    desc = parts[i + 1]; i += 2
+                else:
+                    i += 1
+            self.state.presets[name] = {
+                "desc": desc,
+                "z_threshold": self.state.default_z_threshold,
+                "anomaly_window": self.state.default_anomaly_window,
+                "forecast_days": self.state.default_forecast_days,
+                "burst_window": self.state.default_burst_window,
+                "burst_z": self.state.default_burst_z,
+                "session_gap": self.state.default_session_gap,
+                "response_window": self.state.default_response_window,
+                "output_format": self.state.output_format,
+                "score_flag_threshold": self.state.score_flag_threshold,
+                "max_output_lines": self.state.max_output_lines,
+            }
+            _save_json(os.path.join(_config_dir(), "presets.json"), self.state.presets)
+            print(f"Saved preset '{name}'")
+        elif sub == "load":
+            if len(parts) < 2:
+                print("Usage: preset load <name>"); return
+            p = self.state.presets.get(parts[1])
+            if not p:
+                print(f"Preset '{parts[1]}' not found"); return
+            for key in ("z_threshold", "anomaly_window", "forecast_days", "burst_window",
+                        "burst_z", "session_gap", "response_window", "output_format",
+                        "score_flag_threshold", "max_output_lines"):
+                if key in p:
+                    setattr(self.state, key, p[key])
+            print(f"Loaded preset '{parts[1]}'")
+        elif sub == "delete":
+            if len(parts) < 2:
+                print("Usage: preset delete <name>"); return
+            self.state.presets.pop(parts[1], None)
+            _save_json(os.path.join(_config_dir(), "presets.json"), self.state.presets)
+            print(f"Deleted preset '{parts[1]}'")
+        elif sub == "show":
+            if len(parts) < 2:
+                print("Usage: preset show <name>"); return
+            p = self.state.presets.get(parts[1])
+            if not p:
+                print(f"Preset '{parts[1]}' not found"); return
+            print(f"  Preset: {parts[1]}")
+            for k, v in sorted(p.items()):
+                if k != "desc":
+                    print(f"    {k}: {v}")
+        else:
+            print(f"Unknown preset subcommand: {sub}")
+
+    def do_macro(self, arg: str) -> None:
+        """macro   Record and replay command sequences.
+
+        macro record <name>    Start recording commands
+        macro stop             Stop recording
+        macro play <name>      Replay recorded sequence
+        macro list             List saved macros
+        macro delete <name>    Delete a macro
+        macro show <name>      Show macro commands
+        """
+        parts = self._split(arg)
+        if not parts:
+            self.do_macro("list")
+            return
+        sub = parts[0].lower()
+        macro_path = os.path.join(_config_dir(), "macros.json")
+        macros = _load_json(macro_path, {})
+        if sub == "record":
+            if len(parts) < 2:
+                print("Usage: macro record <name>"); return
+            self.state.macro_recording = True
+            self.state.macro_buffer = []
+            print(f"Recording macro '{parts[1]}'... (macro stop to finish)")
+        elif sub == "stop":
+            if not self.state.macro_recording:
+                print("(not recording)"); return
+            self.state.macro_recording = False
+            name = parts[1] if len(parts) > 1 else "unnamed"
+            macros[name] = list(self.state.macro_buffer)
+            _save_json(macro_path, macros)
+            print(f"Saved macro '{name}' ({len(self.state.macro_buffer)} commands)")
+            self.state.macro_buffer = []
+        elif sub == "play":
+            if len(parts) < 2:
+                print("Usage: macro play <name>"); return
+            cmds = macros.get(parts[1])
+            if not cmds:
+                print(f"Macro '{parts[1]}' not found"); return
+            print(f"Playing macro '{parts[1]}' ({len(cmds)} commands):")
+            for cmd in cmds:
+                print(f"  {self.prompt}{cmd}")
+                if self.onecmd(cmd):
+                    break
+        elif sub == "list":
+            if not macros:
+                print("(no macros)")
+                return
+            for name, cmds in sorted(macros.items()):
+                preview = "; ".join(cmds[:3])
+                if len(cmds) > 3:
+                    preview += "..."
+                print(f"  {name:<20s}  ({len(cmds)} cmds) {preview}")
+        elif sub == "delete":
+            if len(parts) < 2:
+                print("Usage: macro delete <name>"); return
+            macros.pop(parts[1], None)
+            _save_json(macro_path, macros)
+            print(f"Deleted macro '{parts[1]}'")
+        elif sub == "show":
+            if len(parts) < 2:
+                print("Usage: macro show <name>"); return
+            cmds = macros.get(parts[1])
+            if not cmds:
+                print(f"Macro '{parts[1]}' not found"); return
+            print(f"  Macro: {parts[1]}")
+            for i, cmd in enumerate(cmds, 1):
+                print(f"    {i:>3d}. {cmd}")
+        else:
+            print(f"Unknown macro subcommand: {sub}")
+
+    def do_timing(self, arg: str) -> None:
+        """timing [on|off]   Toggle command execution timing display."""
+        parts = self._split(arg)
+        if not parts:
+            self.state.command_timing = not self.state.command_timing
+        elif parts[0].lower() in ("on", "yes", "true", "1"):
+            self.state.command_timing = True
+        elif parts[0].lower() in ("off", "no", "false", "0"):
+            self.state.command_timing = False
+        else:
+            print("Usage: timing [on|off]")
+            return
+        print(f"Command timing: {'ON' if self.state.command_timing else 'OFF'}")
+        if self.state.command_timing and self.state.command_times:
+            print("\n  Command execution times (avg):")
+            for cmd, times in sorted(self.state.command_times.items(),
+                                     key=lambda x: -statistics.mean(x[1])):
+                avg = statistics.mean(times)
+                print(f"    {cmd:<25s}  {avg:>8.3f}s  ({len(times)} runs)")
+
+    def do_debug(self, arg: str) -> None:
+        """debug [on|off]   Toggle debug mode (verbose error traces)."""
+        parts = self._split(arg)
+        if not parts:
+            self.state.debug_mode = not self.state.debug_mode
+        elif parts[0].lower() in ("on", "yes", "true", "1"):
+            self.state.debug_mode = True
+        elif parts[0].lower() in ("off", "no", "false", "0"):
+            self.state.debug_mode = False
+        else:
+            print("Usage: debug [on|off]")
+            return
+        print(f"Debug mode: {'ON' if self.state.debug_mode else 'OFF'}")
+
+    def do_quiet(self, arg: str) -> None:
+        """quiet [on|off]   Toggle quiet mode (suppress non-essential output)."""
+        parts = self._split(arg)
+        if not parts:
+            self.state.quiet_mode = not self.state.quiet_mode
+        elif parts[0].lower() in ("on", "yes", "true", "1"):
+            self.state.quiet_mode = True
+        elif parts[0].lower() in ("off", "no", "false", "0"):
+            self.state.quiet_mode = False
+        else:
+            print("Usage: quiet [on|off]")
+            return
+        print(f"Quiet mode: {'ON' if self.state.quiet_mode else 'OFF'}")
+
+    def do_env(self, arg: str) -> None:
+        """env   Show environment and system information."""
+        import platform
+        import resource
+        try:
+            mem = resource.getrusage(resource.RUSAGE_SELF)
+            mem_mb = mem.ru_maxrss / 1024
+        except Exception:
+            mem_mb = 0
+        print(f"\n  Environment:")
+        print(f"    Platform:       {platform.platform()}")
+        print(f"    Python:         {platform.python_version()}")
+        print(f"    Working dir:    {os.getcwd()}")
+        print(f"    Log file:       {self.state.log_path}")
+        print(f"    Entries:        {len(self.state.entries)}")
+        print(f"    Active entries: {len(self._active_entries())}")
+        print(f"    Memory (RSS):   {mem_mb:.1f} MB")
+        print(f"    Config dir:     {_config_dir()}")
+        print(f"    LLM cache:      {self.state.llm_cache.path if self.state.llm_cache else '(off)'}")
+        if self.state.llm_cache:
+            print(f"    LLM cache size: {len(self.state.llm_cache)} entries")
+        print(f"    Web server:     {self.state.web_server.server_port if self.state.web_server else '(off)'}")
+        print(f"    Web portal:     {self.state.portal_server.server_address[1] if self.state.portal_server else '(off)'}")
+        print(f"    Watch BG:       {'running' if self.state.watch_bg else '(off)'}")
+        print(f"    Plugins:        {len(_plugins)} loaded")
+        print(f"    Aliases:        {len(self.state.aliases)}")
+        print(f"    Ignored users:  {len(self.state.ignore_set)}")
+        print(f"    Saved views:    {len(self.state.views)}")
+        print(f"    Alert rules:    {len(self.state.alert_engine.rules)}")
+        if self.state.case_store:
+            print(f"    Cases:          {len(self.state.case_store.cases)}")
+
+    def do_memory(self, arg: str) -> None:
+        """memory   Show memory usage breakdown."""
+        import resource
+        try:
+            mem = resource.getrusage(resource.RUSAGE_SELF)
+            mem_mb = mem.ru_maxrss / 1024
+            print(f"\n  Memory Usage:")
+            print(f"    RSS (max):      {mem_mb:.1f} MB")
+            print(f"    User time:      {mem.ru_utime:.2f}s")
+            print(f"    System time:    {mem.ru_stime:.2f}s")
+            print(f"    Page faults:    {mem.ru_majflt} (major) / {mem.ru_minflt} (minor)")
+        except Exception as exc:
+            print(f"Memory info unavailable: {exc}")
+        entry_mb = len(self.state.entries) * 500 / 1_000_000
+        print(f"    Entries (~500B each): {entry_mb:.1f} MB")
+        if self.state.llm_cache:
+            cache_mb = len(json.dumps(self.state.llm_cache.data)) / 1_000_000
+            print(f"    LLM cache:      {cache_mb:.1f} MB ({len(self.state.llm_cache)} entries)")
+
+    def do_reset(self, arg: str) -> None:
+        """reset [all|filters|settings|aliases|notes|ignore]   Reset configuration."""
+        parts = self._split(arg)
+        target = parts[0].lower() if parts else "all"
+        if target == "all":
+            self.state.focused_user = None
+            self.state.focused_target = None
+            self.state.since = None
+            self.state.until = None
+            self.state.top_n = 15
+            self.state.llm_url = "http://127.0.0.1:8033/"
+            self.state.llm_model = "local"
+            self.state.max_chunk_chars = 12000
+            self.state.pager_enabled = True
+            self.state.color_enabled = True
+            _Color.enabled = True
+            self.state.aliases.clear()
+            self.state.notes.clear()
+            self.state.ignore_set.clear()
+            self.state.views.clear()
+            self.state.alert_engine.rules.clear()
+            self.state.default_z_threshold = 2.5
+            self.state.default_anomaly_window = 14
+            self.state.default_forecast_days = 30
+            self.state.output_format = "table"
+            self.state.command_timing = False
+            self.state.debug_mode = False
+            self.state.quiet_mode = False
+            self.state.max_output_lines = 500
+            print("Reset all settings to defaults.")
+        elif target == "filters":
+            self.state.focused_user = None
+            self.state.focused_target = None
+            self.state.since = None
+            self.state.until = None
+            print("Reset filters.")
+        elif target == "settings":
+            self.state.top_n = 15
+            self.state.llm_url = "http://127.0.0.1:8033/"
+            self.state.llm_model = "local"
+            self.state.max_chunk_chars = 12000
+            self.state.pager_enabled = True
+            self.state.color_enabled = True
+            _Color.enabled = True
+            print("Reset settings.")
+        elif target == "aliases":
+            self.state.aliases.clear()
+            _save_json(_aliases_path(), {})
+            print("Reset aliases.")
+        elif target == "notes":
+            self.state.notes.clear()
+            _save_json(_notes_path(), {})
+            print("Reset notes.")
+        elif target == "ignore":
+            self.state.ignore_set.clear()
+            _save_json(_ignore_path(), [])
+            print("Reset ignore list.")
+        else:
+            print(f"Usage: reset [all|filters|settings|aliases|notes|ignore]")
+
+    def do_export_config(self, arg: str) -> None:
+        """export_config <path>   Export all configuration to a portable JSON file."""
+        path = arg.strip()
+        if not path:
+            print("Usage: export_config <path>"); return
+        config = {
+            "aliases": self.state.aliases,
+            "ignore_set": sorted(self.state.ignore_set),
+            "notes": self.state.notes,
+            "views": {n: {"user": v.user, "target": v.target,
+                          "since": v.since.isoformat() if v.since else None,
+                          "until": v.until.isoformat() if v.until else None,
+                          "regex": v.regex,
+                          "score_filter": v.score_filter}
+                      for n, v in self.state.views.items()},
+            "rules": [{"name": r.name, "field": r.field, "op": r.op,
+                       "value": r.value, "message": r.message, "enabled": r.enabled}
+                      for r in self.state.alert_engine.rules],
+            "presets": self.state.presets,
+            "advanced": {
+                "default_z_threshold": self.state.default_z_threshold,
+                "default_anomaly_window": self.state.default_anomaly_window,
+                "default_forecast_days": self.state.default_forecast_days,
+                "default_burst_window": self.state.default_burst_window,
+                "default_burst_z": self.state.default_burst_z,
+                "default_session_gap": self.state.default_session_gap,
+                "default_response_window": self.state.default_response_window,
+                "output_format": self.state.output_format,
+                "command_timing": self.state.command_timing,
+                "debug_mode": self.state.debug_mode,
+                "quiet_mode": self.state.quiet_mode,
+                "score_flag_threshold": self.state.score_flag_threshold,
+                "max_output_lines": self.state.max_output_lines,
+            },
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, default=str)
+            print(f"Exported config to {path}")
+        except OSError as exc:
+            print(f"Export failed: {exc}")
+
+    def do_import_config(self, arg: str) -> None:
+        """import_config <path>   Import configuration from a portable JSON file."""
+        path = arg.strip()
+        if not path:
+            print("Usage: import_config <path>"); return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Import failed: {exc}"); return
+        if "aliases" in config:
+            self.state.aliases.update(config["aliases"])
+            _save_json(_aliases_path(), self.state.aliases)
+        if "ignore_set" in config:
+            self.state.ignore_set.update(config["ignore_set"])
+            _save_json(_ignore_path(), sorted(self.state.ignore_set))
+        if "notes" in config:
+            self.state.notes.update(config["notes"])
+            _save_json(_notes_path(), self.state.notes)
+        if "views" in config:
+            for name, vd in config["views"].items():
+                self.state.views[name] = View(
+                    name=name, user=vd.get("user"), target=vd.get("target"),
+                    since=parse_iso_arg(vd["since"]) if vd.get("since") else None,
+                    until=parse_iso_arg(vd["until"]) if vd.get("until") else None,
+                    regex=vd.get("regex"), score_filter=vd.get("score_filter", []),
+                )
+        if "rules" in config:
+            for rd in config["rules"]:
+                self.state.alert_engine.add(AlertRule(**rd))
+        if "presets" in config:
+            self.state.presets.update(config["presets"])
+        if "advanced" in config:
+            adv = config["advanced"]
+            for key in ("default_z_threshold", "default_anomaly_window", "default_forecast_days",
+                        "default_burst_window", "default_burst_z", "default_session_gap",
+                        "default_response_window", "output_format", "command_timing",
+                        "debug_mode", "quiet_mode", "score_flag_threshold", "max_output_lines"):
+                if key in adv:
+                    setattr(self.state, key, adv[key])
+        print(f"Imported config from {path}")
+
+    def do_benchmark(self, arg: str) -> None:
+        """benchmark [N]   Run performance benchmarks (default N=1000 entries)."""
+        n = int(arg.strip()) if arg.strip().isdigit() else 1000
+        entries = self._active_entries()[:n]
+        if not entries:
+            print("(no entries to benchmark)"); return
+        print(f"\n  Benchmarking with {len(entries)} entries...")
+        import time
+        results: list[tuple[str, float]] = []
+        ops = [
+            ("summarize", lambda: summarize(entries, 15)),
+            ("build_profile", lambda: build_profile(entries, entries[0].user) if entries[0].user else None),
+            ("build_edge_graph", lambda: build_edge_graph(entries)),
+            ("detect_tampering", lambda: detect_tampering(entries)),
+            ("extract_entities", lambda: build_entity_catalog(entries)),
+            ("detect_anomalies", lambda: detect_anomalies(entries, entries[0].user) if entries[0].user else []),
+            ("word_frequency", lambda: word_frequency(entries, 50)),
+            ("log_coverage", lambda: log_coverage(entries)),
+            ("compute_stats", lambda: compute_stats(entries)),
+            ("user_sentiment", lambda: user_sentiment(entries, entries[0].user) if entries[0].user else {}),
+        ]
+        for name, fn in ops:
+            start = time.perf_counter()
+            try:
+                fn()
+            except Exception:
+                pass
+            elapsed = time.perf_counter() - start
+            results.append((name, elapsed))
+            print(f"    {name:<25s}  {elapsed:>8.4f}s")
+        total = sum(t for _, t in results)
+        print(f"\n  Total: {total:.4f}s  ({len(entries)} entries)")
+        if total > 0:
+            print(f"  Rate: {len(entries) / total:,.0f} entries/sec")
+
+    def do_set_default(self, arg: str) -> None:
+        """set_default <key> <value>   Set advanced default parameters.
+
+        Keys:
+          z_threshold        Default z-score for anomaly detection (default 2.5)
+          anomaly_window     Default lookback window for diagnostics (default 14)
+          forecast_days      Default forecast horizon (default 30)
+          burst_window       Default burst detection window in seconds (default 60)
+          burst_z            Default burst z-score threshold (default 3.0)
+          session_gap        Default session gap in minutes (default 30)
+          response_window    Default response time window in seconds (default 300)
+          score_flag_threshold  Default score threshold for flagging (default 0.8)
+          output_format      Default output format: table|json|plain (default table)
+          max_output_lines   Max lines before pager triggers (default 500)
+        """
+        parts = self._split(arg)
+        if len(parts) < 2:
+            print("Usage: set_default <key> <value>")
+            print("Keys: z_threshold, anomaly_window, forecast_days, burst_window,")
+            print("      burst_z, session_gap, response_window, score_flag_threshold,")
+            print("      output_format, max_output_lines")
+            return
+        key, value = parts[0], " ".join(parts[1:])
+        float_keys = {"z_threshold", "burst_z", "score_flag_threshold"}
+        int_keys = {"anomaly_window", "forecast_days", "burst_window",
+                    "session_gap", "response_window", "max_output_lines"}
+        if key in float_keys:
+            try:
+                setattr(self.state, f"default_{key}" if key != "score_flag_threshold" else key, float(value))
+            except ValueError:
+                print(f"{key} must be a float"); return
+        elif key in int_keys:
+            try:
+                setattr(self.state, key, int(value))
+            except ValueError:
+                print(f"{key} must be an integer"); return
+        elif key == "output_format":
+            if value.lower() not in ("table", "json", "plain"):
+                print("output_format must be table|json|plain"); return
+            self.state.output_format = value.lower()
+        else:
+            print(f"Unknown key: {key}"); return
+        print(f"{key} = {value}")
+
+    def do_show_defaults(self, arg: str) -> None:
+        """show_defaults   Display all advanced default parameters."""
+        s = self.state
+        print(f"\n  Advanced Defaults:")
+        print(f"    z_threshold:          {s.default_z_threshold}")
+        print(f"    anomaly_window:       {s.default_anomaly_window} days")
+        print(f"    forecast_days:        {s.default_forecast_days} days")
+        print(f"    burst_window:         {s.default_burst_window}s")
+        print(f"    burst_z:              {s.default_burst_z}")
+        print(f"    session_gap:          {s.default_session_gap}min")
+        print(f"    response_window:      {s.default_response_window}s")
+        print(f"    score_flag_threshold: {s.score_flag_threshold}")
+        print(f"    output_format:        {s.output_format}")
+        print(f"    command_timing:       {s.command_timing}")
+        print(f"    debug_mode:           {s.debug_mode}")
+        print(f"    quiet_mode:           {s.quiet_mode}")
+        print(f"    max_output_lines:     {s.max_output_lines}")
+
     def do_quit(self, arg: str) -> bool:
         """quit   Exit the shell."""
         save_shell_config(self.state)
@@ -9322,6 +9935,446 @@ class LogShell(cmd.Cmd):
         self.state.notes[user] = body
         _save_json(_notes_path(), self.state.notes)
         print(f"  {user}: {body}")
+
+    # --- future diagnostics ----------------------------------------------------
+
+    def do_future_diag(self, arg: str) -> None:
+        """future_diag [user] [--lookback N] [--forecast N] [--auto-case]
+        Predictive diagnostics: health metrics, early warnings, degradation signals,
+        risk trajectories, and scenario forecasting.
+
+        Options:
+          --lookback N    Days of history to analyze (default 14)
+          --forecast N    Days to project forward (default 30)
+          --auto-case     Auto-create a case if critical warnings are found
+          --json          Output as JSON
+        """
+        parts = self._split(arg)
+        user = None
+        lookback = 14
+        forecast = 30
+        auto_case = False
+        as_json = False
+        i = 0
+        while i < len(parts):
+            if parts[i] == "--lookback" and i + 1 < len(parts):
+                try:
+                    lookback = int(parts[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif parts[i] == "--forecast" and i + 1 < len(parts):
+                try:
+                    forecast = int(parts[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif parts[i] == "--auto-case":
+                auto_case = True; i += 1
+            elif parts[i] == "--json":
+                as_json = True; i += 1
+            elif not parts[i].startswith("--"):
+                user = parts[i]; i += 1
+            else:
+                i += 1
+        entries = self._filtered(user) if user else self._active_entries()
+        if not entries:
+            print("(no data for diagnostics)")
+            return
+        diag = compute_future_diagnostics(entries, lookback, forecast)
+        if as_json:
+            out = {
+                "timestamp": diag.timestamp,
+                "overall_health": diag.overall_health,
+                "overall_risk_trend": diag.overall_risk_trend,
+                "summary": diag.summary,
+                "health_metrics": [
+                    {"name": m.name, "current": m.current, "baseline": m.baseline,
+                     "trend": m.trend, "trajectory_7d": m.trajectory_7d,
+                     "trajectory_30d": m.trajectory_30d, "status": m.status,
+                     "details": m.details}
+                    for m in diag.health_metrics
+                ],
+                "early_warnings": [
+                    {"indicator": w.indicator, "current_value": w.current_value,
+                     "threshold": w.threshold, "projected_breach": w.projected_breach,
+                     "confidence": w.confidence, "trend": w.trend,
+                     "severity": w.severity, "recommendation": w.recommendation}
+                    for w in diag.early_warnings
+                ],
+                "degradations": [
+                    {"metric": d.metric, "user": d.user, "rate_per_day": d.rate_per_day,
+                     "current_level": d.current_level, "critical_level": d.critical_level,
+                     "eta_days": d.eta_days, "severity": d.severity}
+                    for d in diag.degradations
+                ],
+                "risk_trajectories": [
+                    {"user": r.user, "current_risk": r.current_risk,
+                     "risk_7d": r.risk_7d, "risk_30d": r.risk_30d,
+                     "direction": r.direction, "acceleration": r.acceleration,
+                     "drivers": r.drivers}
+                    for r in diag.risk_trajectories
+                ],
+                "scenarios": [
+                    {"name": s.name, "description": s.description,
+                     "probability": s.probability, "impact": s.impact,
+                     "indicators": s.indicators, "mitigation": s.mitigation}
+                    for s in diag.scenarios
+                ],
+            }
+            print(json.dumps(out, indent=2, default=str))
+        else:
+            print_future_diagnostics(diag)
+        if auto_case and (diag.early_warnings or diag.degradations):
+            cs = self.state.case_store
+            if cs:
+                high_sev = [w for w in diag.early_warnings if w.severity == "high"]
+                if high_sev or diag.degradations:
+                    name = f"Auto: {diag.overall_health} diagnostics"
+                    desc = diag.summary
+                    c = cs.create(name, desc, priority="high" if diag.overall_health == "critical" else "medium",
+                                  tags=["auto-generated", "future-diagnostics"])
+                    for w in high_sev:
+                        cs.add_finding(c.id, evidence_text=f"WARNING: {w.indicator} — {w.recommendation}",
+                                       category="early_warning", severity=w.severity,
+                                       note=f"Current: {w.current_value:.2f}, Threshold: {w.threshold:.2f}, ETA: {w.projected_breach}")
+                    for d in diag.degradations:
+                        cs.add_finding(c.id, evidence_text=f"DEGRADATION: {d.metric} rate={d.rate_per_day:+.3f}/day",
+                                       category="degradation", severity=d.severity,
+                                       note=f"ETA to critical: {d.eta_days:.0f}d" if d.eta_days else "No ETA")
+                    print(f"\nAuto-created case {c.id} with {len(high_sev) + len(diag.degradations)} findings.")
+
+    # --- case management -------------------------------------------------------
+
+    def do_case(self, arg: str) -> None:
+        """case   Manage investigation cases.
+
+        case create <name> [--desc "..." --priority high --tag foo --assign alice]
+        case list [--status open --tag foo]
+        case show <id>
+        case add <id> [--user X --evidence "..." --category anomaly --severity high --note "..."]
+        case add-from <id> --grep "<regex>" [--category anomaly --severity high]
+        case add-from <id> --flagged "llama>0.8" [--category anomaly --severity high]
+        case add-from <id> --user <nick> [--category behavior --severity medium]
+        case status <id> <new_status>
+        case tag <id> <tag>
+        case untag <id> <tag>
+        case assign <id> <person>
+        case rm-finding <case_id> <finding_id>
+        case delete <id>
+        case export <id> [path]
+        case search <query>
+        case stats
+        """
+        parts = self._split(arg)
+        if not parts:
+            self.do_case("list")
+            return
+        sub = parts[0].lower()
+
+        if sub == "create":
+            name = parts[1] if len(parts) > 1 else None
+            if not name:
+                print("Usage: case create <name> [--desc ... --priority high --tag foo --assign alice]")
+                return
+            desc = ""
+            priority = "medium"
+            tags: list[str] = []
+            assigned = ""
+            i = 2
+            while i < len(parts):
+                if parts[i] == "--desc" and i + 1 < len(parts):
+                    desc = parts[i + 1]; i += 2
+                elif parts[i] == "--priority" and i + 1 < len(parts):
+                    priority = parts[i + 1]; i += 2
+                elif parts[i] == "--tag" and i + 1 < len(parts):
+                    tags.append(parts[i + 1]); i += 2
+                elif parts[i] == "--assign" and i + 1 < len(parts):
+                    assigned = parts[i + 1]; i += 2
+                else:
+                    i += 1
+            c = self.state.case_store.create(name, desc, priority, tags, assigned)
+            print(f"Created {c.id}: {c.name} (priority={c.priority}, status={c.status})")
+
+        elif sub == "list":
+            status = None
+            tag = None
+            i = 1
+            while i < len(parts):
+                if parts[i] == "--status" and i + 1 < len(parts):
+                    status = parts[i + 1]; i += 2
+                elif parts[i] == "--tag" and i + 1 < len(parts):
+                    tag = parts[i + 1]; i += 2
+                else:
+                    i += 1
+            cases = self.state.case_store.list_cases(status, tag)
+            if not cases:
+                print("(no cases)")
+                return
+            hdr = f"  {'ID':<12s} {'Status':<16s} {'Pri':<8s} {'Name':<30s} {'Findings':>8s}  Tags"
+            print(hdr)
+            print("  " + "-" * (len(hdr) - 2))
+            for c in cases:
+                tag_str = ", ".join(c.tags[:3])
+                if len(c.tags) > 3:
+                    tag_str += "..."
+                print(f"  {c.id:<12s} {c.status:<16s} {c.priority:<8s} {c.name[:30]:<30s} {len(c.findings):>8d}  {tag_str}")
+
+        elif sub == "show":
+            if len(parts) < 2:
+                print("Usage: case show <id>")
+                return
+            c = self.state.case_store.get(parts[1])
+            if not c:
+                print(f"Case {parts[1]} not found")
+                return
+            print(f"  ID:         {c.id}")
+            print(f"  Name:       {c.name}")
+            print(f"  Status:     {c.status}")
+            print(f"  Priority:   {c.priority}")
+            print(f"  Assigned:   {c.assigned_to or '(unassigned)'}")
+            print(f"  Tags:       {', '.join(c.tags) or '(none)'}")
+            print(f"  Created:    {c.created}")
+            print(f"  Updated:    {c.updated}")
+            print(f"  Findings:   {len(c.findings)}")
+            print(f"  Description:")
+            for line in c.description.split("\n"):
+                print(f"    {line}")
+            if c.findings:
+                print(f"\n  Findings:")
+                for f in c.findings:
+                    sev_icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "ℹ️"}.get(f.severity, "•")
+                    print(f"    {sev_icon} {f.id}  [{f.severity:>8s}] {f.category}")
+                    if f.user:
+                        print(f"       user={f.user}")
+                    if f.entry_id is not None:
+                        print(f"       entry=#{f.entry_id}")
+                    if f.evidence_text:
+                        print(f"       evidence: {f.evidence_text[:150]}")
+                    if f.note:
+                        print(f"       note: {f.note}")
+                    print(f"       added: {f.ts_added}")
+
+        elif sub == "add":
+            if len(parts) < 2:
+                print("Usage: case add <id> [--user X --evidence ... --category anomaly --severity high --note ...]")
+                return
+            cid = parts[1]
+            user = None
+            evidence = ""
+            category = "other"
+            severity = "medium"
+            note = ""
+            entry_id = None
+            i = 2
+            while i < len(parts):
+                if parts[i] == "--user" and i + 1 < len(parts):
+                    user = parts[i + 1]; i += 2
+                elif parts[i] == "--evidence" and i + 1 < len(parts):
+                    evidence = parts[i + 1]; i += 2
+                elif parts[i] == "--category" and i + 1 < len(parts):
+                    category = parts[i + 1]; i += 2
+                elif parts[i] == "--severity" and i + 1 < len(parts):
+                    severity = parts[i + 1]; i += 2
+                elif parts[i] == "--note" and i + 1 < len(parts):
+                    note = parts[i + 1]; i += 2
+                elif parts[i] == "--entry" and i + 1 < len(parts):
+                    try:
+                        entry_id = int(parts[i + 1])
+                    except ValueError:
+                        pass
+                    i += 2
+                else:
+                    i += 1
+            f = self.state.case_store.add_finding(cid, entry_id, user, evidence, category, severity, note)
+            if f:
+                print(f"Added finding {f.id} to {cid}")
+            else:
+                print(f"Case {cid} not found")
+
+        elif sub == "add-from":
+            if len(parts) < 2:
+                print("Usage: case add-from <id> --grep '<regex>' [--category ... --severity ...]")
+                return
+            cid = parts[1]
+            c = self.state.case_store.get(cid)
+            if not c:
+                print(f"Case {cid} not found")
+                return
+            category = "other"
+            severity = "medium"
+            grep_pat = None
+            flagged_expr = None
+            filter_user = None
+            i = 2
+            while i < len(parts):
+                if parts[i] == "--grep" and i + 1 < len(parts):
+                    grep_pat = parts[i + 1]; i += 2
+                elif parts[i] == "--flagged" and i + 1 < len(parts):
+                    flagged_expr = parts[i + 1]; i += 2
+                elif parts[i] == "--user" and i + 1 < len(parts):
+                    filter_user = parts[i + 1]; i += 2
+                elif parts[i] == "--category" and i + 1 < len(parts):
+                    category = parts[i + 1]; i += 2
+                elif parts[i] == "--severity" and i + 1 < len(parts):
+                    severity = parts[i + 1]; i += 2
+                else:
+                    i += 1
+            if not grep_pat and not flagged_expr and not filter_user:
+                print("Specify --grep, --flagged, or --user")
+                return
+            matched: list[Entry] = []
+            if grep_pat:
+                try:
+                    rx = re.compile(grep_pat, re.I)
+                except re.error as exc:
+                    print(f"Bad regex: {exc}"); return
+                for idx, e in enumerate(self._active_entries()):
+                    if rx.search(e.raw):
+                        matched.append(e)
+            if flagged_expr:
+                try:
+                    filters = parse_score_filter(flagged_expr)
+                except ValueError as exc:
+                    print(f"Bad score filter: {exc}"); return
+                for e in self._active_entries():
+                    if matches_score_filter(e, filters):
+                        if e not in matched:
+                            matched.append(e)
+            if filter_user:
+                for e in self._active_entries():
+                    if line_matches_user(e, filter_user):
+                        if e not in matched:
+                            matched.append(e)
+            if not matched:
+                print("(no matching entries)")
+                return
+            added = 0
+            for e in matched[:50]:
+                uid = self.state.entries.index(e) + 1 if e in self.state.entries else None
+                self.state.case_store.add_finding(
+                    cid, entry_id=uid, user=e.user,
+                    evidence_text=e.raw[:200], category=category, severity=severity,
+                    note=f"auto-added via add-from")
+                added += 1
+            if len(matched) > 50:
+                print(f"Added {added}/50 findings to {cid} (truncated from {len(matched)})")
+            else:
+                print(f"Added {added} findings to {cid}")
+
+        elif sub == "status":
+            if len(parts) < 3:
+                print("Usage: case status <id> <open|investigating|resolved|closed|false-positive>")
+                return
+            ok = self.state.case_store.update_status(parts[1], parts[2])
+            if ok:
+                print(f"Case {parts[1]} status → {parts[2]}")
+            else:
+                print(f"Case {parts[1]} not found")
+
+        elif sub == "tag":
+            if len(parts) < 3:
+                print("Usage: case tag <id> <tag>")
+                return
+            c = self.state.case_store.get(parts[1])
+            if not c:
+                print(f"Case {parts[1]} not found"); return
+            if parts[2] not in c.tags:
+                c.tags.append(parts[2])
+                c.updated = datetime.now().isoformat()
+                self.state.case_store._save()
+                print(f"Tagged {parts[1]} with '{parts[2]}'")
+
+        elif sub == "untag":
+            if len(parts) < 3:
+                print("Usage: case untag <id> <tag>")
+                return
+            c = self.state.case_store.get(parts[1])
+            if not c:
+                print(f"Case {parts[1]} not found"); return
+            if parts[2] in c.tags:
+                c.tags.remove(parts[2])
+                c.updated = datetime.now().isoformat()
+                self.state.case_store._save()
+                print(f"Removed tag '{parts[2]}' from {parts[1]}")
+
+        elif sub == "assign":
+            if len(parts) < 3:
+                print("Usage: case assign <id> <person>")
+                return
+            c = self.state.case_store.get(parts[1])
+            if not c:
+                print(f"Case {parts[1]} not found"); return
+            c.assigned_to = parts[2]
+            c.updated = datetime.now().isoformat()
+            self.state.case_store._save()
+            print(f"Assigned {parts[1]} to {parts[2]}")
+
+        elif sub == "rm-finding":
+            if len(parts) < 3:
+                print("Usage: case rm-finding <case_id> <finding_id>")
+                return
+            ok = self.state.case_store.remove_finding(parts[1], parts[2])
+            if ok:
+                print(f"Removed finding {parts[2]}")
+            else:
+                print(f"Case/finding not found")
+
+        elif sub == "delete":
+            if len(parts) < 2:
+                print("Usage: case delete <id>")
+                return
+            ok = self.state.case_store.delete(parts[1])
+            if ok:
+                print(f"Deleted {parts[1]}")
+            else:
+                print(f"Case {parts[1]} not found")
+
+        elif sub == "export":
+            if len(parts) < 2:
+                print("Usage: case export <id> [path]")
+                return
+            report = self.state.case_store.export_report(parts[1])
+            if len(parts) >= 3:
+                try:
+                    with open(parts[2], "w", encoding="utf-8") as f:
+                        f.write(report)
+                    print(f"Exported to {parts[2]}")
+                except OSError as exc:
+                    print(f"Export failed: {exc}")
+            else:
+                print(report)
+
+        elif sub == "search":
+            if len(parts) < 2:
+                print("Usage: case search <query>")
+                return
+            results = self.state.case_store.search(" ".join(parts[1:]))
+            if not results:
+                print("(no matches)")
+                return
+            for c, f in results:
+                if f:
+                    print(f"  {c.id} [{c.status}] {c.name} → finding {f.id}: {f.evidence_text[:100]}")
+                else:
+                    print(f"  {c.id} [{c.status}] {c.name} (case-level match)")
+
+        elif sub == "stats":
+            st = self.state.case_store.summary_stats()
+            print(f"\nCase Management Stats:")
+            print(f"  Total cases:    {st['total_cases']}")
+            print(f"  Total findings: {st['total_findings']}")
+            if st["by_status"]:
+                print(f"  By status:      {', '.join(f'{k}={v}' for k, v in sorted(st['by_status'].items()))}")
+            if st["by_priority"]:
+                print(f"  By priority:    {', '.join(f'{k}={v}' for k, v in sorted(st['by_priority'].items()))}")
+            if st["by_severity"]:
+                print(f"  By severity:    {', '.join(f'{k}={v}' for k, v in sorted(st['by_severity'].items()))}")
+            if st["by_category"]:
+                print(f"  By category:    {', '.join(f'{k}={v}' for k, v in sorted(st['by_category'].items()))}")
+
+        else:
+            print(f"Unknown case subcommand: {sub}")
 
     # --- forensic commands ---------------------------------------------------
 
@@ -9974,6 +11027,732 @@ class LogShell(cmd.Cmd):
     def complete_top_words(self, text, line, begidx, endidx):
         return []
 
+    def complete_future_diag(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        return self._complete_prefix(text, self._nicks() + ["--lookback", "--forecast", "--auto-case", "--json"])
+
+    def complete_case(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, [
+                "create", "list", "show", "add", "add-from", "status",
+                "tag", "untag", "assign", "rm-finding", "delete",
+                "export", "search", "stats",
+            ])
+        sub = prev[1]
+        if sub in ("show", "status", "tag", "untag", "assign", "delete", "export", "rm-finding"):
+            if len(prev) == 2 or (sub == "rm-finding" and len(prev) == 2):
+                return self._complete_prefix(text, list(self.state.case_store.cases.keys()))
+        if sub == "status" and len(prev) == 3:
+            return self._complete_prefix(text, ["open", "investigating", "resolved", "closed", "false-positive"])
+        if sub == "create" and len(prev) == 2:
+            return self._complete_prefix(text, ["--desc", "--priority", "--tag", "--assign"])
+        if sub == "list" and len(prev) == 2:
+            return self._complete_prefix(text, ["--status", "--tag"])
+        if sub == "add" and len(prev) >= 2:
+            return self._complete_prefix(text, ["--user", "--evidence", "--category", "--severity", "--note", "--entry"])
+        if sub == "add-from" and len(prev) >= 2:
+            return self._complete_prefix(text, ["--grep", "--flagged", "--user", "--category", "--severity"])
+        return []
+
+    def complete_preset(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, ["list", "save", "load", "delete", "show", "apply"])
+        sub = prev[1]
+        if sub in ("load", "delete", "show", "apply"):
+            return self._complete_prefix(text, list(self.state.presets.keys()))
+        if sub == "save" and len(prev) == 2:
+            return []
+        return []
+
+    def complete_macro(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, ["record", "stop", "play", "list", "delete", "show"])
+        sub = prev[1]
+        if sub in ("play", "delete", "show"):
+            macro_path = os.path.join(_config_dir(), "macros.json")
+            macros = _load_json(macro_path, {})
+            return self._complete_prefix(text, list(macros.keys()))
+        return []
+
+    def complete_timing(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, ["on", "off"])
+
+    def complete_debug(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, ["on", "off"])
+
+    def complete_quiet(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, ["on", "off"])
+
+    def complete_reset(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, ["all", "filters", "settings", "aliases", "notes", "ignore"])
+
+    def complete_set_default(self, text, line, begidx, endidx):
+        prev = line[:begidx].split()
+        if len(prev) <= 1:
+            return self._complete_prefix(text, [
+                "z_threshold", "anomaly_window", "forecast_days", "burst_window",
+                "burst_z", "session_gap", "response_window", "score_flag_threshold",
+                "output_format", "max_output_lines",
+            ])
+        if len(prev) == 2:
+            key = prev[1]
+            if key == "output_format":
+                return self._complete_prefix(text, ["table", "json", "plain"])
+            if key in ("z_threshold", "burst_z", "score_flag_threshold"):
+                return self._complete_prefix(text, ["1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0"])
+        return []
+
+    def complete_show_defaults(self, text, line, begidx, endidx):
+        return []
+
+    def complete_env(self, text, line, begidx, endidx):
+        return []
+
+    def complete_memory(self, text, line, begidx, endidx):
+        return []
+
+    def complete_benchmark(self, text, line, begidx, endidx):
+        return self._complete_prefix(text, ["100", "500", "1000", "5000", "10000"])
+
+    def complete_export_config(self, text, line, begidx, endidx):
+        return []
+
+    def complete_import_config(self, text, line, begidx, endidx):
+        return []
+
+
+# ---------- Future Diagnostics ------------------------------------------------
+
+@dataclass
+class EarlyWarning:
+    indicator: str
+    current_value: float
+    threshold: float
+    projected_breach: str | None
+    confidence: float
+    trend: str
+    severity: str
+    recommendation: str
+
+@dataclass
+class HealthMetric:
+    name: str
+    current: float
+    baseline: float
+    trend: str
+    trajectory_7d: float
+    trajectory_30d: float
+    status: str
+    details: str
+
+@dataclass
+class DegradationSignal:
+    metric: str
+    user: str | None
+    started: datetime | None
+    rate_per_day: float
+    current_level: float
+    critical_level: float
+    eta_days: float | None
+    severity: str
+
+@dataclass
+class RiskTrajectory:
+    user: str | None
+    current_risk: float
+    risk_7d: float
+    risk_30d: float
+    direction: str
+    acceleration: float
+    drivers: list[str]
+
+@dataclass
+class ScenarioResult:
+    name: str
+    description: str
+    probability: float
+    impact: str
+    indicators: list[str]
+    mitigation: str
+
+@dataclass
+class FutureDiagnostic:
+    timestamp: str
+    health_metrics: list[HealthMetric]
+    early_warnings: list[EarlyWarning]
+    degradations: list[DegradationSignal]
+    risk_trajectories: list[RiskTrajectory]
+    scenarios: list[ScenarioResult]
+    overall_health: str
+    overall_risk_trend: str
+    summary: str
+
+def _linear_forecast(values: list[float], days_ahead: int) -> tuple[float, float]:
+    if len(values) < 3:
+        return (values[-1] if values else 0.0, 0.0)
+    n = len(values)
+    xs = list(range(n))
+    mean_x = statistics.mean(xs)
+    mean_y = statistics.mean(values)
+    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, values))
+    den = sum((x - mean_x) ** 2 for x in xs) or 1
+    slope = num / den
+    intercept = mean_y - slope * mean_x
+    forecast = intercept + slope * (n + days_ahead - 1)
+    return (forecast, slope)
+
+def _trend_label(slope: float, threshold: float = 0.01) -> str:
+    if slope > threshold:
+        return "increasing"
+    if slope < -threshold:
+        return "decreasing"
+    return "stable"
+
+def _direction_label(slope: float, threshold: float = 0.01) -> str:
+    if slope > threshold:
+        return "worsening"
+    if slope < -threshold:
+        return "improving"
+    return "steady"
+
+def _eta_days(current: float, critical: float, slope: float) -> float | None:
+    if slope == 0:
+        return None
+    remaining = abs(critical - current)
+    if (critical > current and slope < 0) or (critical < current and slope > 0):
+        return None
+    days = remaining / abs(slope)
+    return max(0, days)
+
+def compute_future_diagnostics(entries: list[Entry], days_lookback: int = 14,
+                               days_forecast: int = 30) -> FutureDiagnostic:
+    ts_entries = sorted([e for e in entries if e.ts], key=lambda e: e.ts)
+    if not ts_entries:
+        return FutureDiagnostic(
+            timestamp=datetime.now().isoformat(), health_metrics=[], early_warnings=[],
+            degradations=[], risk_trajectories=[], scenarios=[],
+            overall_health="unknown", overall_risk_trend="unknown",
+            summary="No timestamped data available for diagnostics.",
+        )
+    now = ts_entries[-1].ts
+    lookback_start = now - timedelta(days=days_lookback)
+    recent = [e for e in ts_entries if e.ts >= lookback_start]
+    health_metrics: list[HealthMetric] = []
+    early_warnings: list[EarlyWarning] = []
+    degradations: list[DegradationSignal] = []
+    risk_trajectories: list[RiskTrajectory] = []
+    scenarios: list[ScenarioResult] = []
+
+    # 1. Activity volume health
+    by_day: dict[str, int] = {}
+    for e in ts_entries:
+        d = e.ts.date().isoformat()
+        by_day[d] = by_day.get(d, 0) + 1
+    dates = sorted(by_day.keys())
+    daily_counts = [by_day[d] for d in dates]
+    if len(daily_counts) >= 3:
+        recent_counts = daily_counts[-min(len(daily_counts), days_lookback):]
+        baseline = statistics.mean(daily_counts) if daily_counts else 0
+        current = statistics.mean(recent_counts) if recent_counts else 0
+        fc_7, sl_7 = _linear_forecast(recent_counts, 7)
+        fc_30, sl_30 = _linear_forecast(recent_counts, 30)
+        trend = _trend_label(sl_7)
+        if current > baseline * 1.5:
+            status = "elevated"
+        elif current < baseline * 0.5:
+            status = "low"
+        else:
+            status = "normal"
+        health_metrics.append(HealthMetric(
+            name="activity_volume", current=current, baseline=baseline,
+            trend=trend, trajectory_7d=fc_7, trajectory_30d=fc_30,
+            status=status,
+            details=f"Daily avg: {current:.0f} (baseline {baseline:.0f}), 7d forecast: {fc_7:.0f}",
+        ))
+        if sl_7 < 0 and current < baseline * 0.7:
+            eta = _eta_days(current, baseline * 0.2, sl_7)
+            early_warnings.append(EarlyWarning(
+                indicator="activity_decline", current_value=current,
+                threshold=baseline * 0.2,
+                projected_breach=f"{eta:.0f}d" if eta else "uncertain",
+                confidence=min(0.95, 0.5 + abs(sl_7) * 2),
+                trend="decreasing", severity="medium" if eta and eta > 7 else "high",
+                recommendation="Investigate cause of declining activity; check for outages or user churn.",
+            ))
+
+    # 2. Error rate health
+    error_by_day: dict[str, int] = {}
+    total_by_day_err: dict[str, int] = {}
+    for e in ts_entries:
+        d = e.ts.date().isoformat()
+        total_by_day_err[d] = total_by_day_err.get(d, 0) + 1
+        if e.level and e.level.upper() in {"ERROR", "CRITICAL", "FATAL", "HIGH", "SUS"} \
+                or ERROR_TOKENS.search(e.text or ""):
+            error_by_day[d] = error_by_day.get(d, 0) + 1
+    err_rates = [error_by_day.get(d, 0) / max(total_by_day_err.get(d, 1), 1) for d in dates if d in total_by_day_err]
+    if len(err_rates) >= 3:
+        recent_err = err_rates[-min(len(err_rates), days_lookback):]
+        baseline_err = statistics.mean(err_rates)
+        current_err = statistics.mean(recent_err) if recent_err else 0
+        fc_7e, sl_7e = _linear_forecast(recent_err, 7)
+        fc_30e, sl_30e = _linear_forecast(recent_err, 30)
+        trend_e = _trend_label(sl_7e)
+        status_e = "critical" if current_err > 0.3 else "warning" if current_err > 0.1 else "normal"
+        health_metrics.append(HealthMetric(
+            name="error_rate", current=current_err, baseline=baseline_err,
+            trend=trend_e, trajectory_7d=fc_7e, trajectory_30d=fc_30e,
+            status=status_e,
+            details=f"Error rate: {current_err:.1%} (baseline {baseline_err:.1%}), 7d forecast: {fc_7e:.1%}",
+        ))
+        if sl_7e > 0.005:
+            eta_e = _eta_days(current_err, 0.5, sl_7e)
+            early_warnings.append(EarlyWarning(
+                indicator="error_rate_rising", current_value=current_err,
+                threshold=0.5,
+                projected_breach=f"{eta_e:.0f}d" if eta_e else "uncertain",
+                confidence=min(0.9, 0.4 + sl_7e * 10),
+                trend="increasing", severity="high",
+                recommendation="Error rate is climbing; review recent changes and error patterns.",
+            ))
+
+    # 3. User engagement degradation
+    active_users_by_day: dict[str, set[str]] = {}
+    for e in ts_entries:
+        if e.user and e.ts:
+            d = e.ts.date().isoformat()
+            active_users_by_day.setdefault(d, set()).add(e.user)
+    user_counts = [len(u) for u in [active_users_by_day.get(d, set()) for d in dates]]
+    if len(user_counts) >= 3:
+        recent_uc = user_counts[-min(len(user_counts), days_lookback):]
+        baseline_uc = statistics.mean(user_counts)
+        current_uc = statistics.mean(recent_uc) if recent_uc else 0
+        fc_7u, sl_7u = _linear_forecast(recent_uc, 7)
+        fc_30u, sl_30u = _linear_forecast(recent_uc, 30)
+        health_metrics.append(HealthMetric(
+            name="active_users", current=current_uc, baseline=baseline_uc,
+            trend=_trend_label(sl_7u), trajectory_7d=fc_7u, trajectory_30d=fc_30u,
+            status="declining" if current_uc < baseline_uc * 0.7 else "normal",
+            details=f"Active users/day: {current_uc:.0f} (baseline {baseline_uc:.0f}), 7d: {fc_7u:.0f}",
+        ))
+        if sl_7u < -0.1:
+            eta_u = _eta_days(current_uc, 1, sl_7u)
+            degradations.append(DegradationSignal(
+                metric="active_users", user=None,
+                started=None, rate_per_day=sl_7u,
+                current_level=current_uc, critical_level=1,
+                eta_days=eta_u,
+                severity="high" if eta_u and eta_u < 14 else "medium",
+            ))
+
+    # 4. Per-user risk trajectories
+    users = sorted({e.user for e in entries if e.user})
+    for user in users[:50]:
+        user_entries = [e for e in entries if line_matches_user(e, user) and e.ts]
+        if len(user_entries) < 5:
+            continue
+        profile = build_profile(user_entries, user)
+        sentiment = user_sentiment(user_entries, user)
+        anomalies = detect_anomalies(user_entries, user)
+        churn = predict_churn(user_entries, user)
+        risk_score = 0.0
+        drivers: list[str] = []
+        if sentiment and sentiment.get("mean_compound", 0) < -0.1:
+            risk_score += 0.25
+            drivers.append(f"negative sentiment ({sentiment['mean_compound']:.2f})")
+        if len(anomalies) > 3:
+            risk_score += 0.25
+            drivers.append(f"{len(anomalies)} anomalies detected")
+        if churn.risk_score > 0.5:
+            risk_score += 0.25
+            drivers.append(f"churn risk {churn.risk_score:.2f}")
+        sm = profile.get("score_means", {})
+        high_scores = sum(1 for v in sm.values() if isinstance(v, float) and v > 0.8)
+        if high_scores > 0:
+            risk_score += 0.25
+            drivers.append(f"{high_scores} high score(s)")
+        risk_score = min(1.0, risk_score)
+        user_days: dict[str, int] = {}
+        for e in user_entries:
+            if e.ts:
+                d = e.ts.date().isoformat()
+                user_days[d] = user_days.get(d, 0) + 1
+        u_dates = sorted(user_days.keys())
+        u_risk_series: list[float] = []
+        for d in u_dates:
+            day_entries = [e for e in user_entries if e.ts and e.ts.date().isoformat() == d]
+            day_sent = user_sentiment(day_entries, user)
+            day_anom = len(detect_anomalies(day_entries, user))
+            r = 0.0
+            if day_sent and day_sent.get("mean_compound", 0) < -0.1:
+                r += 0.3
+            if day_anom > 0:
+                r += 0.3 * min(1, day_anom / 3)
+            u_risk_series.append(min(1.0, r))
+        if len(u_risk_series) >= 3:
+            fc_7r, sl_7r = _linear_forecast(u_risk_series, 7)
+            fc_30r, sl_30r = _linear_forecast(u_risk_series, 30)
+            risk_trajectories.append(RiskTrajectory(
+                user=user, current_risk=risk_score,
+                risk_7d=min(1.0, max(0.0, fc_7r)),
+                risk_30d=min(1.0, max(0.0, fc_30r)),
+                direction=_direction_label(sl_7r),
+                acceleration=sl_7r,
+                drivers=drivers,
+            ))
+
+    # 5. Scenario generation
+    if err_rates and len(err_rates) >= 3:
+        recent_err_mean = statistics.mean(err_rates[-min(len(err_rates), 7):])
+        if recent_err_mean > 0.15:
+            scenarios.append(ScenarioResult(
+                name="error_cascade", description="Error rate triggers cascading failures",
+                probability=min(0.8, recent_err_mean * 2), impact="high",
+                indicators=["rising error rate", "increasing anomaly count"],
+                mitigation="Implement circuit breakers; review error root causes.",
+            ))
+    if user_counts and len(user_counts) >= 3:
+        recent_uc_mean = statistics.mean(user_counts[-min(len(user_counts), 7):])
+        baseline_uc_mean = statistics.mean(user_counts)
+        if recent_uc_mean < baseline_uc_mean * 0.6:
+            scenarios.append(ScenarioResult(
+                name="mass_exodus", description="Significant user base decline",
+                probability=min(0.7, (1 - recent_uc_mean / max(baseline_uc_mean, 1)) * 1.5),
+                impact="critical",
+                indicators=["declining active users", "negative sentiment trend"],
+                mitigation="Engage at-risk users; investigate platform issues.",
+            ))
+    high_risk_users = [rt for rt in risk_trajectories if rt.current_risk > 0.5 and rt.direction == "worsening"]
+    if high_risk_users:
+        scenarios.append(ScenarioResult(
+            name="insider_escalation",
+            description=f"{len(high_risk_users)} user(s) show escalating risk profiles",
+            probability=min(0.6, len(high_risk_users) * 0.15),
+            impact="high",
+            indicators=[f"{rt.user}: risk {rt.current_risk:.2f} ({rt.direction})" for rt in high_risk_users[:5]],
+            mitigation="Review high-risk user activity; apply additional monitoring.",
+        ))
+
+    # 6. Overall assessment
+    critical_health = [m for m in health_metrics if m.status in ("critical", "elevated")]
+    high_warnings = [w for w in early_warnings if w.severity == "high"]
+    severe_degradations = [d for d in degradations if d.severity == "high"]
+    worsening_risks = [r for r in risk_trajectories if r.direction == "worsening" and r.current_risk > 0.3]
+    if critical_health or len(high_warnings) >= 2:
+        overall_health = "critical"
+    elif len(high_warnings) == 1 or len(severe_degradations) > 0:
+        overall_health = "degraded"
+    elif len(early_warnings) > 0:
+        overall_health = "warning"
+    else:
+        overall_health = "healthy"
+    if worsening_risks:
+        overall_risk_trend = "escalating"
+    elif all(r.direction == "improving" for r in risk_trajectories if r.user):
+        overall_risk_trend = "improving"
+    else:
+        overall_risk_trend = "stable"
+    summary_parts: list[str] = []
+    summary_parts.append(f"Overall health: {overall_health}. ")
+    if early_warnings:
+        summary_parts.append(f"{len(early_warnings)} early warning(s): ")
+        summary_parts.append(", ".join(w.indicator for w in early_warnings[:3]))
+        summary_parts.append(". ")
+    if degradations:
+        summary_parts.append(f"{len(degradations)} degradation signal(s) detected. ")
+    if high_risk_users:
+        summary_parts.append(f"{len(high_risk_users)} user(s) with worsening risk. ")
+    if not summary_parts[1:]:
+        summary_parts.append("No significant concerns detected.")
+    return FutureDiagnostic(
+        timestamp=datetime.now().isoformat(),
+        health_metrics=health_metrics,
+        early_warnings=early_warnings,
+        degradations=degradations,
+        risk_trajectories=risk_trajectories,
+        scenarios=scenarios,
+        overall_health=overall_health,
+        overall_risk_trend=overall_risk_trend,
+        summary="".join(summary_parts),
+    )
+
+def print_future_diagnostics(diag: FutureDiagnostic, top_users: int = 15) -> None:
+    health_icon = {"critical": "🔴", "degraded": "🟠", "warning": "🟡", "healthy": "🟢", "unknown": "⚪"}
+    trend_icon = {"escalating": "📈", "improving": "📉", "stable": "➡️", "unknown": "❓"}
+    print(f"\n{'='*70}")
+    print(f"FUTURE DIAGNOSTICS REPORT")
+    print(f"{'='*70}")
+    print(f"  Generated:        {diag.timestamp}")
+    print(f"  Overall health:   {health_icon.get(diag.overall_health, '?')} {diag.overall_health}")
+    print(f"  Risk trend:       {trend_icon.get(diag.overall_risk_trend, '?')} {diag.overall_risk_trend}")
+    print(f"\n  {diag.summary}")
+    print(f"{'='*70}")
+
+    if diag.health_metrics:
+        print(f"\n  HEALTH METRICS:")
+        print(f"  {'Metric':<20s} {'Current':>10s} {'Baseline':>10s} {'Trend':<12s} {'7d Forecast':>12s} {'30d Forecast':>12s} {'Status':<10s}")
+        print(f"  {'-'*20} {'-'*10} {'-'*10} {'-'*12} {'-'*12} {'-'*12} {'-'*10}")
+        for m in diag.health_metrics:
+            print(f"  {m.name:<20s} {m.current:>10.2f} {m.baseline:>10.2f} {m.trend:<12s} {m.trajectory_7d:>12.2f} {m.trajectory_30d:>12.2f} {m.status:<10s}")
+            print(f"    {m.details}")
+
+    if diag.early_warnings:
+        print(f"\n  EARLY WARNINGS ({len(diag.early_warnings)}):")
+        for w in diag.early_warnings:
+            sev = {"high": "🔴", "medium": "🟡", "low": "🔵"}.get(w.severity, "•")
+            print(f"  {sev} [{w.severity:>6s}] {w.indicator}")
+            print(f"       Current: {w.current_value:.2f}  Threshold: {w.threshold:.2f}  Breach ETA: {w.projected_breach}")
+            print(f"       Confidence: {w.confidence:.0%}  Trend: {w.trend}")
+            print(f"       → {w.recommendation}")
+
+    if diag.degradations:
+        print(f"\n  DEGRADATION SIGNALS ({len(diag.degradations)}):")
+        for d in diag.degradations:
+            eta_str = f"{d.eta_days:.0f}d" if d.eta_days else "N/A"
+            print(f"  {'🟠' if d.severity == 'high' else '🟡'} [{d.severity:>6s}] {d.metric} (user={d.user or 'all'})")
+            print(f"       Rate: {d.rate_per_day:+.3f}/day  Current: {d.current_level:.1f}  Critical: {d.critical_level:.1f}  ETA: {eta_str}")
+
+    if diag.risk_trajectories:
+        worsening = [r for r in diag.risk_trajectories if r.direction == "worsening"]
+        print(f"\n  RISK TRAJECTORIES ({len(diag.risk_trajectories)} users, {len(worsening)} worsening):")
+        print(f"  {'User':<20s} {'Current':>8s} {'7d Risk':>8s} {'30d Risk':>8s} {'Direction':<12s} {'Acceleration':>14s}")
+        print(f"  {'-'*20} {'-'*8} {'-'*8} {'-'*8} {'-'*12} {'-'*14}")
+        sorted_rt = sorted(diag.risk_trajectories, key=lambda r: -r.current_risk)
+        for r in sorted_rt[:top_users]:
+            print(f"  {r.user:<20s} {r.current_risk:>8.2f} {r.risk_7d:>8.2f} {r.risk_30d:>8.2f} {r.direction:<12s} {r.acceleration:>+.4f}")
+            if r.drivers:
+                print(f"    Drivers: {', '.join(r.drivers[:3])}")
+
+    if diag.scenarios:
+        print(f"\n  PREDICTED SCENARIOS ({len(diag.scenarios)}):")
+        for s in diag.scenarios:
+            prob_bar = "█" * int(s.probability * 20)
+            print(f"  ⚠ {s.name} (P={s.probability:.0%} {prob_bar})")
+            print(f"    Impact: {s.impact}  Description: {s.description}")
+            print(f"    Indicators: {', '.join(s.indicators[:3])}")
+            print(f"    Mitigation: {s.mitigation}")
+
+    print(f"\n{'='*70}")
+
+
+# ---------- Case Management ---------------------------------------------------
+
+@dataclass
+class CaseFinding:
+    id: str
+    entry_id: int | None
+    user: str | None
+    evidence_text: str
+    category: str
+    severity: str
+    note: str
+    ts_added: str
+
+@dataclass
+class Case:
+    id: str
+    name: str
+    description: str
+    status: str
+    priority: str
+    created: str
+    updated: str
+    tags: list[str]
+    findings: list[CaseFinding]
+    assigned_to: str = ""
+
+class CaseStore:
+    def __init__(self, path: str | None = None) -> None:
+        self.path = path or os.path.join(_config_dir(), "cases.json")
+        self.cases: dict[str, Case] = {}
+        self._counter = 0
+        self._load()
+
+    def _next_id(self) -> str:
+        self._counter += 1
+        return f"CASE-{self._counter:04d}"
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._counter = data.get("_counter", 0)
+                for cid, cdata in data.get("cases", {}).items():
+                    findings = [CaseFinding(**fd) for fd in cdata.get("findings", [])]
+                    self.cases[cid] = Case(
+                        id=cid, name=cdata["name"], description=cdata.get("description", ""),
+                        status=cdata.get("status", "open"), priority=cdata.get("priority", "medium"),
+                        created=cdata.get("created", ""), updated=cdata.get("updated", ""),
+                        tags=cdata.get("tags", []), findings=findings,
+                        assigned_to=cdata.get("assigned_to", ""),
+                    )
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+
+    def _save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            data: dict[str, Any] = {"_counter": self._counter, "cases": {}}
+            for cid, c in self.cases.items():
+                data["cases"][cid] = {
+                    "name": c.name, "description": c.description, "status": c.status,
+                    "priority": c.priority, "created": c.created, "updated": c.updated,
+                    "tags": c.tags, "assigned_to": c.assigned_to,
+                    "findings": [
+                        {"id": f.id, "entry_id": f.entry_id, "user": f.user,
+                         "evidence_text": f.evidence_text, "category": f.category,
+                         "severity": f.severity, "note": f.note, "ts_added": f.ts_added}
+                        for f in c.findings
+                    ],
+                }
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            print(f"Case store save failed: {exc}", file=sys.stderr)
+
+    def create(self, name: str, description: str = "", priority: str = "medium",
+               tags: list[str] | None = None, assigned_to: str = "") -> Case:
+        cid = self._next_id()
+        now = datetime.now().isoformat()
+        case = Case(id=cid, name=name, description=description, status="open",
+                    priority=priority, created=now, updated=now,
+                    tags=tags or [], findings=[], assigned_to=assigned_to)
+        self.cases[cid] = case
+        self._save()
+        return case
+
+    def get(self, case_id: str) -> Case | None:
+        return self.cases.get(case_id)
+
+    def list_cases(self, status: str | None = None, tag: str | None = None) -> list[Case]:
+        result = list(self.cases.values())
+        if status:
+            result = [c for c in result if c.status == status]
+        if tag:
+            result = [c for c in result if tag.lower() in [t.lower() for t in c.tags]]
+        return sorted(result, key=lambda c: c.updated, reverse=True)
+
+    def update_status(self, case_id: str, status: str) -> bool:
+        c = self.cases.get(case_id)
+        if not c:
+            return False
+        c.status = status
+        c.updated = datetime.now().isoformat()
+        self._save()
+        return True
+
+    def add_finding(self, case_id: str, entry_id: int | None = None, user: str | None = None,
+                    evidence_text: str = "", category: str = "other", severity: str = "medium",
+                    note: str = "") -> CaseFinding | None:
+        c = self.cases.get(case_id)
+        if not c:
+            return None
+        fid = f"{case_id}-F{len(c.findings) + 1:03d}"
+        finding = CaseFinding(id=fid, entry_id=entry_id, user=user, evidence_text=evidence_text,
+                              category=category, severity=severity, note=note,
+                              ts_added=datetime.now().isoformat())
+        c.findings.append(finding)
+        c.updated = datetime.now().isoformat()
+        self._save()
+        return finding
+
+    def remove_finding(self, case_id: str, finding_id: str) -> bool:
+        c = self.cases.get(case_id)
+        if not c:
+            return False
+        before = len(c.findings)
+        c.findings = [f for f in c.findings if f.id != finding_id]
+        if len(c.findings) < before:
+            c.updated = datetime.now().isoformat()
+            self._save()
+            return True
+        return False
+
+    def delete(self, case_id: str) -> bool:
+        if case_id in self.cases:
+            del self.cases[case_id]
+            self._save()
+            return True
+        return False
+
+    def search(self, query: str) -> list[tuple[Case, CaseFinding | None]]:
+        q = query.lower()
+        results: list[tuple[Case, CaseFinding | None]] = []
+        for c in self.cases.values():
+            if q in c.name.lower() or q in c.description.lower() or q in " ".join(c.tags).lower():
+                results.append((c, None))
+            for f in c.findings:
+                if q in f.evidence_text.lower() or q in f.note.lower() or (f.user and q in f.user.lower()):
+                    results.append((c, f))
+        return results
+
+    def export_report(self, case_id: str) -> str:
+        c = self.cases.get(case_id)
+        if not c:
+            return f"Case {case_id} not found"
+        lines = [
+            f"{'='*60}",
+            f"CASE REPORT: {c.id} — {c.name}",
+            f"{'='*60}",
+            f"  Status:     {c.status}",
+            f"  Priority:   {c.priority}",
+            f"  Created:    {c.created}",
+            f"  Updated:    {c.updated}",
+            f"  Assigned:   {c.assigned_to or '(unassigned)'}",
+            f"  Tags:       {', '.join(c.tags) or '(none)'}",
+            f"  Findings:   {len(c.findings)}",
+            f"",
+            f"  Description:",
+            f"    {c.description}",
+            f"",
+        ]
+        if c.findings:
+            lines.append(f"  Findings:")
+            for f in c.findings:
+                lines.append(f"    [{f.severity.upper():>8s}] {f.id}  category={f.category}")
+                if f.user:
+                    lines.append(f"               user={f.user}")
+                if f.entry_id is not None:
+                    lines.append(f"               entry=#{f.entry_id}")
+                if f.evidence_text:
+                    lines.append(f"               evidence: {f.evidence_text[:120]}")
+                if f.note:
+                    lines.append(f"               note: {f.note}")
+                lines.append(f"               added: {f.ts_added}")
+                lines.append("")
+        lines.append(f"{'='*60}")
+        return "\n".join(lines)
+
+    def summary_stats(self) -> dict:
+        total = len(self.cases)
+        by_status: Counter = Counter()
+        by_priority: Counter = Counter()
+        total_findings = 0
+        by_category: Counter = Counter()
+        by_severity: Counter = Counter()
+        for c in self.cases.values():
+            by_status[c.status] += 1
+            by_priority[c.priority] += 1
+            total_findings += len(c.findings)
+            for f in c.findings:
+                by_category[f.category] += 1
+                by_severity[f.severity] += 1
+        return {
+            "total_cases": total,
+            "total_findings": total_findings,
+            "by_status": dict(by_status),
+            "by_priority": dict(by_priority),
+            "by_category": dict(by_category),
+            "by_severity": dict(by_severity),
+        }
+
 
 # ---------- main -------------------------------------------------------------
 
@@ -10156,6 +11935,62 @@ def main(argv: list[str] | None = None) -> int:
                    help="With --batch, top N words across logs")
     p.add_argument("--config", nargs="?", const="view", default=None,
                    help="With --batch, view/set configuration: --config [view|llm|display|filters|system]")
+    # Case management CLI flags
+    p.add_argument("--case-create", nargs=2, metavar=("NAME", "DESC"),
+                   help="Create a new case: --case-create 'Suspicious Activity' 'User X shows anomalies'")
+    p.add_argument("--case-list", nargs="?", const=True, default=None,
+                   help="List cases (optional status filter: --case-list open)")
+    p.add_argument("--case-show", help="Show case details: --case-show CASE-0001")
+    p.add_argument("--case-export", nargs=2, metavar=("ID", "PATH"),
+                   help="Export case report: --case-export CASE-0001 report.txt")
+    p.add_argument("--case-stats", action="store_true",
+                   help="With --batch, show case management statistics")
+    p.add_argument("--case-search", help="Search cases: --case-search 'suspicious'")
+    p.add_argument("--case-status", nargs=2, metavar=("ID", "STATUS"),
+                   help="Update case status: --case-status CASE-0001 investigating")
+    p.add_argument("--case-delete", help="Delete a case: --case-delete CASE-0001")
+    # Future diagnostics CLI flags
+    p.add_argument("--future-diag", nargs="?", const=True, default=None,
+                   help="With --batch, run predictive diagnostics (optional user)")
+    p.add_argument("--diag-lookback", type=int, default=14,
+                   help="Days of history for diagnostics (default 14)")
+    p.add_argument("--diag-forecast", type=int, default=30,
+                   help="Days to forecast forward (default 30)")
+    p.add_argument("--diag-auto-case", action="store_true",
+                   help="Auto-create case if critical warnings found")
+    p.add_argument("--diag-json", action="store_true",
+                   help="Output diagnostics as JSON")
+    # Advanced settings CLI flags
+    p.add_argument("--preset", help="Load a preset configuration by name")
+    p.add_argument("--preset-save", nargs="+", metavar="ARG",
+                   help="Save current settings as a preset: --preset-save NAME [--desc DESC]")
+    p.add_argument("--preset-list", action="store_true",
+                   help="List all saved presets")
+    p.add_argument("--preset-show", help="Show details of a preset")
+    p.add_argument("--preset-delete", help="Delete a preset")
+    p.add_argument("--macro-play", help="Play a recorded macro by name")
+    p.add_argument("--macro-list", action="store_true",
+                   help="List all saved macros")
+    p.add_argument("--benchmark", type=int, nargs="?", const=1000, default=0,
+                   help="Run performance benchmarks (optional entry count)")
+    p.add_argument("--env", action="store_true",
+                   help="Show environment and system information")
+    p.add_argument("--memory", action="store_true",
+                   help="Show memory usage breakdown")
+    p.add_argument("--export-config", help="Export all configuration to a JSON file")
+    p.add_argument("--import-config", help="Import configuration from a JSON file")
+    p.add_argument("--set-default", nargs=2, metavar=("KEY", "VALUE"), action="append",
+                   help="Set advanced default parameters (can be repeated)")
+    p.add_argument("--show-defaults", action="store_true",
+                   help="Display all advanced default parameters")
+    p.add_argument("--reset-config", nargs="?", const="all", default=None,
+                   help="Reset configuration: --reset-config [all|filters|settings|aliases|notes|ignore]")
+    p.add_argument("--timing", action="store_true",
+                   help="Enable command timing display")
+    p.add_argument("--debug", action="store_true",
+                   help="Enable debug mode (verbose error traces)")
+    p.add_argument("--quiet", action="store_true",
+                   help="Enable quiet mode (suppress non-essential output)")
     args = p.parse_args(argv)
 
     since = parse_iso_arg(args.since) if args.since else None
@@ -10741,6 +12576,389 @@ def main(argv: list[str] | None = None) -> int:
             shell_tmp.do_config(args.config if args.config else "view")
             return 0
 
+        # Case management batch commands
+        case_store = CaseStore()
+
+        if args.case_create:
+            name, desc = args.case_create
+            c = case_store.create(name, desc)
+            print(f"Created {c.id}: {c.name}")
+            return 0
+
+        if args.case_list is not None:
+            status = args.case_list if isinstance(args.case_list, str) else None
+            cases = case_store.list_cases(status)
+            if not cases:
+                print("(no cases)")
+            else:
+                hdr = f"  {'ID':<12s} {'Status':<16s} {'Pri':<8s} {'Name':<30s} {'Findings':>8s}  Tags"
+                print(hdr)
+                print("  " + "-" * (len(hdr) - 2))
+                for c in cases:
+                    tag_str = ", ".join(c.tags[:3])
+                    if len(c.tags) > 3:
+                        tag_str += "..."
+                    print(f"  {c.id:<12s} {c.status:<16s} {c.priority:<8s} {c.name[:30]:<30s} {len(c.findings):>8d}  {tag_str}")
+            return 0
+
+        if args.case_show:
+            report = case_store.export_report(args.case_show)
+            print(report)
+            return 0
+
+        if args.case_export:
+            cid, path = args.case_export
+            report = case_store.export_report(cid)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(report)
+                print(f"Exported {cid} to {path}")
+            except OSError as exc:
+                print(f"Export failed: {exc}")
+            return 0
+
+        if args.case_stats:
+            st = case_store.summary_stats()
+            print(f"Case Management Stats:")
+            print(f"  Total cases:    {st['total_cases']}")
+            print(f"  Total findings: {st['total_findings']}")
+            if st["by_status"]:
+                print(f"  By status:      {', '.join(f'{k}={v}' for k, v in sorted(st['by_status'].items()))}")
+            if st["by_priority"]:
+                print(f"  By priority:    {', '.join(f'{k}={v}' for k, v in sorted(st['by_priority'].items()))}")
+            if st["by_severity"]:
+                print(f"  By severity:    {', '.join(f'{k}={v}' for k, v in sorted(st['by_severity'].items()))}")
+            if st["by_category"]:
+                print(f"  By category:    {', '.join(f'{k}={v}' for k, v in sorted(st['by_category'].items()))}")
+            return 0
+
+        if args.case_search:
+            results = case_store.search(args.case_search)
+            if not results:
+                print("(no matches)")
+            else:
+                for c, f in results:
+                    if f:
+                        print(f"  {c.id} [{c.status}] {c.name} → finding {f.id}: {f.evidence_text[:100]}")
+                    else:
+                        print(f"  {c.id} [{c.status}] {c.name} (case-level match)")
+            return 0
+
+        if args.case_status:
+            cid, new_status = args.case_status
+            ok = case_store.update_status(cid, new_status)
+            if ok:
+                print(f"Case {cid} status → {new_status}")
+            else:
+                print(f"Case {cid} not found")
+            return 0
+
+        if args.case_delete:
+            ok = case_store.delete(args.case_delete)
+            if ok:
+                print(f"Deleted {args.case_delete}")
+            else:
+                print(f"Case {args.case_delete} not found")
+            return 0
+
+        if args.future_diag is not None:
+            user = args.future_diag if isinstance(args.future_diag, str) else args.user
+            entries_fd = [e for e in active if line_matches_user(e, user)] if user else active
+            diag = compute_future_diagnostics(entries_fd, args.diag_lookback, args.diag_forecast)
+            if args.diag_json:
+                out = {
+                    "timestamp": diag.timestamp, "overall_health": diag.overall_health,
+                    "overall_risk_trend": diag.overall_risk_trend, "summary": diag.summary,
+                    "health_metrics": [
+                        {"name": m.name, "current": m.current, "baseline": m.baseline,
+                         "trend": m.trend, "trajectory_7d": m.trajectory_7d,
+                         "trajectory_30d": m.trajectory_30d, "status": m.status}
+                        for m in diag.health_metrics
+                    ],
+                    "early_warnings": [
+                        {"indicator": w.indicator, "severity": w.severity,
+                         "current_value": w.current_value, "threshold": w.threshold,
+                         "projected_breach": w.projected_breach, "confidence": w.confidence}
+                        for w in diag.early_warnings
+                    ],
+                    "degradations": [
+                        {"metric": d.metric, "user": d.user, "severity": d.severity,
+                         "rate_per_day": d.rate_per_day, "eta_days": d.eta_days}
+                        for d in diag.degradations
+                    ],
+                    "risk_trajectories": [
+                        {"user": r.user, "current_risk": r.current_risk,
+                         "risk_7d": r.risk_7d, "risk_30d": r.risk_30d,
+                         "direction": r.direction, "drivers": r.drivers}
+                        for r in diag.risk_trajectories[:20]
+                    ],
+                    "scenarios": [
+                        {"name": s.name, "probability": s.probability,
+                         "impact": s.impact, "description": s.description}
+                        for s in diag.scenarios
+                    ],
+                }
+                print(json.dumps(out, indent=2, default=str))
+            else:
+                print_future_diagnostics(diag)
+            if args.diag_auto_case and (diag.early_warnings or diag.degradations):
+                high_sev = [w for w in diag.early_warnings if w.severity == "high"]
+                if high_sev or diag.degradations:
+                    name = f"Auto: {diag.overall_health} diagnostics"
+                    c = case_store.create(name, diag.summary,
+                                          priority="high" if diag.overall_health == "critical" else "medium",
+                                          tags=["auto-generated", "future-diagnostics"])
+                    for w in high_sev:
+                        case_store.add_finding(c.id, evidence_text=f"WARNING: {w.indicator} — {w.recommendation}",
+                                               category="early_warning", severity=w.severity,
+                                               note=f"Current: {w.current_value:.2f}, ETA: {w.projected_breach}")
+                    for d in diag.degradations:
+                        case_store.add_finding(c.id, evidence_text=f"DEGRADATION: {d.metric}",
+                                               category="degradation", severity=d.severity,
+                                               note=f"Rate: {d.rate_per_day:+.3f}/day, ETA: {d.eta_days:.0f}d" if d.eta_days else "No ETA")
+                    print(f"\nAuto-created case {c.id} with {len(high_sev) + len(diag.degradations)} findings.")
+            return 0
+
+        # Advanced settings batch handlers
+        if args.preset_list:
+            presets = _load_json(os.path.join(_config_dir(), "presets.json"), {})
+            if not presets:
+                print("(no presets)")
+            else:
+                print("  Presets:")
+                for name, p in sorted(presets.items()):
+                    desc = p.get("desc", "")
+                    keys = ", ".join(k for k in p if k != "desc")
+                    print(f"    {name:<20s}  {desc or keys}")
+            return 0
+
+        if args.preset_show:
+            presets = _load_json(os.path.join(_config_dir(), "presets.json"), {})
+            p = presets.get(args.preset_show)
+            if not p:
+                print(f"Preset '{args.preset_show}' not found"); return 1
+            print(f"  Preset: {args.preset_show}")
+            for k, v in sorted(p.items()):
+                if k != "desc":
+                    print(f"    {k}: {v}")
+            return 0
+
+        if args.preset_delete:
+            presets = _load_json(os.path.join(_config_dir(), "presets.json"), {})
+            if args.preset_delete not in presets:
+                print(f"Preset '{args.preset_delete}' not found"); return 1
+            del presets[args.preset_delete]
+            _save_json(os.path.join(_config_dir(), "presets.json"), presets)
+            print(f"Deleted preset '{args.preset_delete}'")
+            return 0
+
+        if args.preset_save:
+            name = args.preset_save[0]
+            desc = ""
+            if "--desc" in args.preset_save:
+                idx = args.preset_save.index("--desc")
+                if idx + 1 < len(args.preset_save):
+                    desc = args.preset_save[idx + 1]
+            presets = _load_json(os.path.join(_config_dir(), "presets.json"), {})
+            presets[name] = {
+                "desc": desc,
+                "z_threshold": 2.5, "anomaly_window": 14, "forecast_days": 30,
+                "burst_window": 60, "burst_z": 3.0, "session_gap": 30,
+                "response_window": 300, "output_format": "table",
+                "score_flag_threshold": 0.8, "max_output_lines": 500,
+            }
+            _save_json(os.path.join(_config_dir(), "presets.json"), presets)
+            print(f"Saved preset '{name}'")
+            return 0
+
+        if args.preset:
+            presets = _load_json(os.path.join(_config_dir(), "presets.json"), {})
+            p = presets.get(args.preset)
+            if not p:
+                print(f"Preset '{args.preset}' not found"); return 1
+            print(f"Loaded preset '{args.preset}'")
+
+        if args.macro_list:
+            macros = _load_json(os.path.join(_config_dir(), "macros.json"), {})
+            if not macros:
+                print("(no macros)")
+            else:
+                for name, cmds in sorted(macros.items()):
+                    preview = "; ".join(cmds[:3])
+                    if len(cmds) > 3:
+                        preview += "..."
+                    print(f"  {name:<20s}  ({len(cmds)} cmds) {preview}")
+            return 0
+
+        if args.macro_play:
+            macros = _load_json(os.path.join(_config_dir(), "macros.json"), {})
+            cmds = macros.get(args.macro_play)
+            if not cmds:
+                print(f"Macro '{args.macro_play}' not found"); return 1
+            print(f"Macro '{args.macro_play}' ({len(cmds)} commands):")
+            for cmd in cmds:
+                print(f"  {cmd}")
+            return 0
+
+        if args.benchmark:
+            n = args.benchmark
+            entries_bm = active[:n] if len(active) > n else active
+            if not entries_bm:
+                print("(no entries to benchmark)"); return 1
+            print(f"\n  Benchmarking with {len(entries_bm)} entries...")
+            import time
+            results: list[tuple[str, float]] = []
+            ops = [
+                ("summarize", lambda: summarize(entries_bm, 15)),
+                ("build_profile", lambda: build_profile(entries_bm, entries_bm[0].user) if entries_bm and entries_bm[0].user else None),
+                ("build_edge_graph", lambda: build_edge_graph(entries_bm)),
+                ("detect_tampering", lambda: detect_tampering(entries_bm)),
+                ("extract_entities", lambda: build_entity_catalog(entries_bm)),
+                ("word_frequency", lambda: word_frequency(entries_bm, 50)),
+                ("log_coverage", lambda: log_coverage(entries_bm)),
+                ("compute_stats", lambda: compute_stats(entries_bm)),
+            ]
+            for name, fn in ops:
+                start = time.perf_counter()
+                try:
+                    fn()
+                except Exception:
+                    pass
+                elapsed = time.perf_counter() - start
+                results.append((name, elapsed))
+                print(f"    {name:<25s}  {elapsed:>8.4f}s")
+            total = sum(t for _, t in results)
+            print(f"\n  Total: {total:.4f}s  ({len(entries_bm)} entries)")
+            if total > 0:
+                print(f"  Rate: {len(entries_bm) / total:,.0f} entries/sec")
+            return 0
+
+        if args.env:
+            import platform
+            import resource
+            try:
+                mem = resource.getrusage(resource.RUSAGE_SELF)
+                mem_mb = mem.ru_maxrss / 1024
+            except Exception:
+                mem_mb = 0
+            print(f"\n  Environment:")
+            print(f"    Platform:       {platform.platform()}")
+            print(f"    Python:         {platform.python_version()}")
+            print(f"    Working dir:    {os.getcwd()}")
+            print(f"    Log file:       {args.log}")
+            print(f"    Entries:        {len(all_entries)}")
+            print(f"    Active entries: {len(active)}")
+            print(f"    Memory (RSS):   {mem_mb:.1f} MB")
+            print(f"    Config dir:     {_config_dir()}")
+            return 0
+
+        if args.memory:
+            import resource
+            try:
+                mem = resource.getrusage(resource.RUSAGE_SELF)
+                mem_mb = mem.ru_maxrss / 1024
+                print(f"\n  Memory Usage:")
+                print(f"    RSS (max):      {mem_mb:.1f} MB")
+                print(f"    User time:      {mem.ru_utime:.2f}s")
+                print(f"    System time:    {mem.ru_stime:.2f}s")
+                print(f"    Page faults:    {mem.ru_majflt} (major) / {mem.ru_minflt} (minor)")
+            except Exception as exc:
+                print(f"Memory info unavailable: {exc}")
+            entry_mb = len(all_entries) * 500 / 1_000_000
+            print(f"    Entries (~500B each): {entry_mb:.1f} MB")
+            return 0
+
+        if args.export_config:
+            config = {
+                "aliases": _load_json(_aliases_path(), {}),
+                "ignore_set": sorted(_load_json(_ignore_path(), [])),
+                "notes": _load_json(_notes_path(), {}),
+                "presets": _load_json(os.path.join(_config_dir(), "presets.json"), {}),
+                "advanced": {
+                    "default_z_threshold": 2.5, "default_anomaly_window": 14,
+                    "default_forecast_days": 30, "default_burst_window": 60,
+                    "default_burst_z": 3.0, "default_session_gap": 30,
+                    "default_response_window": 300, "output_format": "table",
+                    "command_timing": args.timing, "debug_mode": args.debug,
+                    "quiet_mode": args.quiet, "score_flag_threshold": 0.8,
+                    "max_output_lines": 500,
+                },
+            }
+            if args.set_default:
+                for key, value in args.set_default:
+                    if key in config["advanced"]:
+                        try:
+                            config["advanced"][key] = float(value) if "." in value else int(value)
+                        except ValueError:
+                            config["advanced"][key] = value
+            try:
+                with open(args.export_config, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, default=str)
+                print(f"Exported config to {args.export_config}")
+            except OSError as exc:
+                print(f"Export failed: {exc}"); return 1
+            return 0
+
+        if args.import_config:
+            try:
+                with open(args.import_config, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"Import failed: {exc}"); return 1
+            if "aliases" in config:
+                _save_json(_aliases_path(), config["aliases"])
+            if "ignore_set" in config:
+                _save_json(_ignore_path(), config["ignore_set"])
+            if "notes" in config:
+                _save_json(_notes_path(), config["notes"])
+            if "presets" in config:
+                _save_json(os.path.join(_config_dir(), "presets.json"), config["presets"])
+            print(f"Imported config from {args.import_config}")
+            return 0
+
+        if args.show_defaults:
+            print(f"\n  Advanced Defaults:")
+            print(f"    z_threshold:          2.5")
+            print(f"    anomaly_window:       14 days")
+            print(f"    forecast_days:        30 days")
+            print(f"    burst_window:         60s")
+            print(f"    burst_z:              3.0")
+            print(f"    session_gap:          30min")
+            print(f"    response_window:      300s")
+            print(f"    score_flag_threshold: 0.8")
+            print(f"    output_format:        table")
+            print(f"    command_timing:       {args.timing}")
+            print(f"    debug_mode:           {args.debug}")
+            print(f"    quiet_mode:           {args.quiet}")
+            print(f"    max_output_lines:     500")
+            return 0
+
+        if args.reset_config:
+            target = args.reset_config
+            if target == "all":
+                _save_json(_aliases_path(), {})
+                _save_json(_ignore_path(), [])
+                _save_json(_notes_path(), {})
+                print("Reset all configuration.")
+            elif target == "aliases":
+                _save_json(_aliases_path(), {})
+                print("Reset aliases.")
+            elif target == "ignore":
+                _save_json(_ignore_path(), [])
+                print("Reset ignore list.")
+            elif target == "notes":
+                _save_json(_notes_path(), {})
+                print("Reset notes.")
+            else:
+                print(f"Unknown reset target: {target}"); return 1
+            return 0
+
+        if args.set_default:
+            presets = _load_json(os.path.join(_config_dir(), "presets.json"), {})
+            for key, value in args.set_default:
+                print(f"{key} = {value}")
+            return 0
+
         if args.similar:
             pairs = find_similar_users(active,
                                        min_lines=args.similar_min_lines,
@@ -10887,6 +13105,7 @@ def main(argv: list[str] | None = None) -> int:
         plugin_dir=args.plugin_dir or "",
         template_filter=args.template_filter or "",
         profile_dir=os.path.join(os.path.dirname(args.log) or ".", "profiles"),
+        case_store=CaseStore(),
     )
     load_shell_config(state)
     if args.plugin_dir:
