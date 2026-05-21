@@ -6059,6 +6059,35 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   #dash .dpd .db{width:8px;background:#0f0;border-radius:1px 1px 0 0;min-height:1px;flex-shrink:0;transition:height .15s}
   #dash .errs{color:#f00;font-size:11px}
   #dash .errs .er{color:#f44;padding:1px 0;border-bottom:1px solid #300;white-space:pre-wrap;word-break:break-all}
+  #dash .dg .btn{background:#001a00;color:#0f0;border:1px solid #0f0;padding:4px 12px;font-family:'Courier New',monospace;font-size:11px;cursor:pointer;border-radius:2px;margin-top:4px;display:inline-block}
+  #dash .dg .btn:hover{background:#003300}
+  #tabGraphView{position:relative}
+  #graphCanvas{display:block;cursor:grab;width:100%;height:100%}
+  #graphCanvas:active{cursor:grabbing}
+  #graphControls{position:absolute;top:8px;right:8px;display:flex;gap:4px;z-index:10}
+  #graphControls button{background:#000;color:#0f0;border:1px solid #030;padding:4px 10px;font-family:'Courier New',monospace;font-size:11px;cursor:pointer;border-radius:2px}
+  #graphControls button:hover{border-color:#0f0;background:#001a00}
+  #graphControls select{background:#000;color:#0f0;border:1px solid #030;padding:4px;font-family:'Courier New',monospace;font-size:11px;border-radius:2px}
+  #graphTooltip{position:absolute;display:none;background:#001a00;border:1px solid #0f0;padding:6px 10px;font-size:11px;pointer-events:none;z-index:20;white-space:pre-wrap;max-width:250px;border-radius:2px}
+  #graphTooltip .tt-user{color:#0f0;font-weight:bold;font-size:13px}
+  #graphTooltip .tt-line{color:#0a0;margin:2px 0}
+  #graphPanel{position:absolute;top:0;right:0;width:280px;height:100%;background:#000;border-left:1px solid #030;overflow-y:auto;z-index:15;transform:translateX(100%);transition:transform .2s}
+  #graphPanel.open{transform:translateX(0)}
+  #graphPanel .gp-header{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid #030}
+  #graphPanel .gp-header h3{color:#0f0;font-size:14px}
+  #graphPanel .gp-close{color:#0f0;cursor:pointer;font-size:18px;background:none;border:none;font-family:'Courier New',monospace}
+  #graphPanel .gp-close:hover{color:#f00}
+  #graphPanel .gp-body{padding:10px 12px}
+  #graphPanel .gp-body .gp-row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #001a00}
+  #graphPanel .gp-body .gp-k{color:#060}
+  #graphPanel .gp-body .gp-v{color:#0f0}
+  #graphPanel .gp-body .gp-section{color:#0f0;font-size:12px;font-weight:bold;margin:10px 0 4px;border-bottom:1px solid #030;padding-bottom:2px}
+  #graphPanel .gp-body .gp-edge{display:flex;justify-content:space-between;padding:2px 0;font-size:11px}
+  #graphPanel .gp-body .gp-edge .gp-a{color:#0f0}
+  #graphPanel .gp-body .gp-edge .gp-w{color:#060}
+  #graphLegend{position:absolute;bottom:8px;left:8px;background:#000;border:1px solid #030;padding:6px 10px;font-size:10px;z-index:10;border-radius:2px}
+  #graphLegend .gl-item{color:#080;margin:1px 0}
+  #graphLegend .gl-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle}
   #footer{display:flex;align-items:center;border-top:1px solid #030;padding:6px 10px;gap:6px;background:#000;flex-shrink:0}
   #footer .prompt{color:#0f0;font-weight:bold}
   #footer input{flex:1;background:#000;color:#0f0;border:1px solid #030;padding:7px 10px;font-family:'Courier New',monospace;font-size:13px;outline:none}
@@ -6083,11 +6112,40 @@ _PORTAL_HTML = r"""<!DOCTYPE html>
   <button id="tabMenu" class="active" onclick="switchTab('menu')">Main Menu</button>
   <button id="tabDash" onclick="switchTab('dash')">Dashboard</button>
   <button id="tabLogs" onclick="switchTab('logs')">Logs</button>
+  <button id="tabGraph" onclick="switchTab('graph')">Graph</button>
 </div>
 <div id="main">
   <div id="tabMenuView" class="tab-content active"><div id="output"></div><div id="menu"></div></div>
   <div id="tabDashView" class="tab-content"><div id="dash"></div></div>
   <div id="tabLogsView" class="tab-content"><div id="messages"></div></div>
+  <div id="tabGraphView" class="tab-content">
+    <canvas id="graphCanvas"></canvas>
+    <div id="graphControls">
+      <select id="graphTopN" onchange="renderGraph()">
+        <option value="10">Top 10</option>
+        <option value="15" selected>Top 15</option>
+        <option value="20">Top 20</option>
+        <option value="30">Top 30</option>
+        <option value="50">Top 50</option>
+      </select>
+      <button onclick="graphReset()" title="Reset view">Reset</button>
+      <button onclick="graphZoom(1.3)" title="Zoom in">+</button>
+      <button onclick="graphZoom(0.7)" title="Zoom out">−</button>
+      <button onclick="toggleGraphPanel()" title="Selected node info">Info</button>
+    </div>
+    <div id="graphTooltip"></div>
+    <div id="graphPanel">
+      <div class="gp-header"><h3 id="gpTitle">Node Info</h3><button class="gp-close" onclick="toggleGraphPanel()">✕</button></div>
+      <div class="gp-body" id="gpBody"></div>
+    </div>
+    <div id="graphLegend">
+      <div class="gl-item"><span class="gl-dot" style="background:#0f0"></span>Node size = activity</div>
+      <div class="gl-item"><span class="gl-dot" style="background:#0a0"></span>Edge thickness = interactions</div>
+      <div class="gl-item">Drag nodes to rearrange</div>
+      <div class="gl-item">Scroll to zoom, drag background to pan</div>
+      <div class="gl-item">Click node for details</div>
+    </div>
+  </div>
 </div>
 <div id="footer-wrapper">
   <div id="autocomplete"></div>
@@ -6110,11 +6168,14 @@ function switchTab(tab){
   el('tabMenu').className=tab==='menu'?'active':'';
   el('tabDash').className=tab==='dash'?'active':'';
   el('tabLogs').className=tab==='logs'?'active':'';
+  el('tabGraph').className=tab==='graph'?'active':'';
   el('tabMenuView').className='tab-content'+(tab==='menu'?' active':'');
   el('tabDashView').className='tab-content'+(tab==='dash'?' active':'');
   el('tabLogsView').className='tab-content'+(tab==='logs'?' active':'');
+  el('tabGraphView').className='tab-content'+(tab==='graph'?' active':'');
   if(tab==='menu'&&!cmds)fetchCmds();
   if(tab==='dash'&&!dash.dataset.loaded)fetchDash();
+  if(tab==='graph'&&!graph.dataset.loaded)fetchGraph();
 }
 
 let nearBottom=true;
@@ -6262,6 +6323,7 @@ function renderDash(d){
     html+='</div></div>';
   }
   html+='<div class="dg" style="margin-top:10px"><span class="lbl">last updated: '+new Date().toLocaleTimeString()+'</span></div>';
+  html+='<div class="dg"><button class="btn" onclick="switchTab(\'graph\')">View Network Graph →</button></div>';
   dash.innerHTML=html;
 }
 
@@ -6419,6 +6481,262 @@ document.addEventListener('click',function(e){
 fetchLog();setInterval(fetchLog,3000);
 fetchCmds();
 setInterval(function(){if(activeTab==='dash')fetchDash();},5000);
+setInterval(function(){if(activeTab==='graph'&&graphData)renderGraph();},5000);
+
+// ── Network Graph ──────────────────────────────────────────────
+var graph=el('graphCanvas'), graphCtx=graph.getContext('2d');
+var graphData=null, graphNodes=[], graphEdges=[];
+var graphScale=1, graphOffX=0, graphOffY=0;
+var graphDrag=null, graphPan=null, graphMouse={x:0,y:0};
+var graphSelected=null, graphAnim=null;
+
+function fetchGraph(){
+  fetch('/api/graph?n='+el('graphTopN').value).then(function(r){return r.json();}).then(function(d){
+    graphData=d;
+    graph.dataset.loaded='1';
+    initGraph();
+  }).catch(function(){});
+}
+
+function initGraph(){
+  if(!graphData)return;
+  resizeGraph();
+  var nodeMap={};
+  graphNodes=[];
+  graphData.nodes.forEach(function(n,i){
+    var angle=i/graphData.nodes.length*Math.PI*2;
+    var radius=150+Math.random()*50;
+    var node={id:n.user,label:n.user,activity:n.count,x:Math.cos(angle)*radius,y:Math.sin(angle)*radius,vx:0,vy:0,pinned:false};
+    graphNodes.push(node);
+    nodeMap[n.user]=node;
+  });
+  graphEdges=[];
+  graphData.edges.forEach(function(e){
+    var a=nodeMap[e.source],b=nodeMap[e.target];
+    if(a&&b)graphEdges.push({source:a,target:b,weight:e.weight});
+  });
+  runSimulation(120);
+  renderGraph();
+}
+
+function resizeGraph(){
+  var rect=graph.parentElement.getBoundingClientRect();
+  graph.width=rect.width;
+  graph.height=rect.height;
+}
+
+function runSimulation(iterations){
+  var k=Math.sqrt((graph.width*graph.height)/Math.max(graphNodes.length,1))*0.8;
+  for(var iter=0;iter<iterations;iter++){
+    var temp=1-iter/iterations;
+    // repulsion
+    for(var i=0;i<graphNodes.length;i++){
+      for(var j=i+1;j<graphNodes.length;j++){
+        var dx=graphNodes[j].x-graphNodes[i].x;
+        var dy=graphNodes[j].y-graphNodes[i].y;
+        var dist=Math.sqrt(dx*dx+dy*dy)||1;
+        var force=k*k/dist;
+        var fx=dx/dist*force,fy=dy/dist*force;
+        if(!graphNodes[i].pinned){graphNodes[i].vx-=fx;graphNodes[i].vy-=fy;}
+        if(!graphNodes[j].pinned){graphNodes[j].vx+=fx;graphNodes[j].vy+=fy;}
+      }
+    }
+    // attraction
+    graphEdges.forEach(function(e){
+      var dx=e.target.x-e.source.x;
+      var dy=e.target.y-e.source.y;
+      var dist=Math.sqrt(dx*dx+dy*dy)||1;
+      var force=dist*dist/k;
+      var fx=dx/dist*force,fy=dy/dist*force;
+      if(!e.source.pinned){e.source.vx+=fx;e.source.vy+=fy;}
+      if(!e.target.pinned){e.target.vx-=fx;e.target.vy-=fy;}
+    });
+    // gravity + apply
+    graphNodes.forEach(function(n){
+      if(n.pinned)return;
+      n.vx-=n.x*0.01;n.vy-=n.y*0.01;
+      var len=Math.sqrt(n.vx*n.vx+n.vy*n.vy)||1;
+      var step=Math.min(len,5*temp)/len;
+      n.x+=n.vx*step;n.y+=n.vy*step;
+      n.vx=0;n.vy=0;
+    });
+  }
+}
+
+function renderGraph(){
+  if(!graphNodes.length)return;
+  resizeGraph();
+  var ctx=graphCtx,w=graph.width,h=graph.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.save();
+  ctx.translate(w/2+graphOffX,h/2+graphOffY);
+  ctx.scale(graphScale,graphScale);
+  // edges
+  var maxW=1;
+  graphEdges.forEach(function(e){if(e.weight>maxW)maxW=e.weight;});
+  graphEdges.forEach(function(e){
+    var thickness=1+e.weight/maxW*4;
+    ctx.beginPath();
+    ctx.moveTo(e.source.x,e.source.y);
+    ctx.lineTo(e.target.x,e.target.y);
+    ctx.strokeStyle='rgba(0,170,0,'+(0.3+e.weight/maxW*0.5)+')';
+    ctx.lineWidth=thickness;
+    ctx.stroke();
+    // arrow
+    var dx=e.target.x-e.source.x,dy=e.target.y-e.source.y;
+    var dist=Math.sqrt(dx*dx+dy*dy)||1;
+    var ax=e.target.x-dx/dist*12,ay=e.target.y-dy/dist*12;
+    var angle=Math.atan2(dy,dx);
+    ctx.beginPath();
+    ctx.moveTo(ax,ay);
+    ctx.lineTo(ax-8*Math.cos(angle-0.4),ay-8*Math.sin(angle-0.4));
+    ctx.lineTo(ax-8*Math.cos(angle+0.4),ay-8*Math.sin(angle+0.4));
+    ctx.closePath();
+    ctx.fillStyle='rgba(0,170,0,0.6)';
+    ctx.fill();
+  });
+  // nodes
+  var maxA=1;
+  graphNodes.forEach(function(n){if(n.activity>maxA)maxA=n.activity;});
+  graphNodes.forEach(function(n){
+    var r=8+Math.sqrt(n.activity/maxA)*25;
+    var sel=graphSelected===n;
+    // glow
+    if(sel){
+      ctx.beginPath();ctx.arc(n.x,n.y,r+6,0,Math.PI*2);
+      ctx.fillStyle='rgba(0,255,0,0.15)';ctx.fill();
+    }
+    // circle
+    ctx.beginPath();ctx.arc(n.x,n.y,r,0,Math.PI*2);
+    var grad=ctx.createRadialGradient(n.x-r*0.3,n.y-r*0.3,0,n.x,n.y,r);
+    grad.addColorStop(0,sel?'#4f4':'#0f0');
+    grad.addColorStop(1,sel?'#0a0':'#060');
+    ctx.fillStyle=grad;ctx.fill();
+    ctx.strokeStyle=sel?'#0f0':'#030';ctx.lineWidth=sel?2:1;ctx.stroke();
+    // label
+    ctx.fillStyle=sel?'#0f0':'#0a0';
+    ctx.font=(sel?'bold ':'')+Math.max(9,Math.min(12,r*0.6))+'px Courier New';
+    ctx.textAlign='center';ctx.textBaseline='top';
+    ctx.fillText(n.label,n.x,n.y+r+3);
+  });
+  ctx.restore();
+}
+
+function graphZoom(factor){
+  graphScale*=factor;
+  graphScale=Math.max(0.2,Math.min(5,graphScale));
+  renderGraph();
+}
+
+function graphReset(){
+  graphScale=1;graphOffX=0;graphOffY=0;
+  if(graphData)initGraph();
+}
+
+function screenToGraph(sx,sy){
+  var rect=graph.getBoundingClientRect();
+  return{x:(sx-rect.left-graph.width/2-graphOffX)/graphScale,y:(sy-rect.top-graph.height/2-graphOffY)/graphScale};
+}
+
+function findNodeAt(sx,sy){
+  var g=screenToGraph(sx,sy);
+  var maxA=1;
+  graphNodes.forEach(function(n){if(n.activity>maxA)maxA=n.activity;});
+  for(var i=graphNodes.length-1;i>=0;i--){
+    var n=graphNodes[i];
+    var r=8+Math.sqrt(n.activity/maxA)*25;
+    var dx=g.x-n.x,dy=g.y-n.y;
+    if(dx*dx+dy*dy<r*r)return n;
+  }
+  return null;
+}
+
+graph.addEventListener('mousedown',function(e){
+  var node=findNodeAt(e.clientX,e.clientY);
+  if(node){
+    graphDrag=node;node.pinned=true;graphSelected=node;
+    showNodePanel(node);
+  }else{
+    graphPan={x:e.clientX-graphOffX,y:e.clientY-graphOffY};
+    graphSelected=null;
+    el('graphPanel').classList.remove('open');
+  }
+  renderGraph();
+});
+
+graph.addEventListener('mousemove',function(e){
+  graphMouse={x:e.clientX,y:e.clientY};
+  if(graphDrag){
+    var g=screenToGraph(e.clientX,e.clientY);
+    graphDrag.x=g.x;graphDrag.y=g.y;
+    renderGraph();
+  }else if(graphPan){
+    graphOffX=e.clientX-graphPan.x;
+    graphOffY=e.clientY-graphPan.y;
+    renderGraph();
+  }else{
+    // tooltip
+    var node=findNodeAt(e.clientX,e.clientY);
+    var tt=el('graphTooltip');
+    if(node){
+      var edges=graphEdges.filter(function(e){return e.source===node||e.target===node;});
+      var html='<div class="tt-user">'+esc(node.label)+'</div>';
+      html+='<div class="tt-line">Activity: '+node.activity+' messages</div>';
+      html+='<div class="tt-line">Connections: '+edges.length+'</div>';
+      edges.slice(0,5).forEach(function(e){
+        var other=e.source===node?e.target:e.source;
+        html+='<div class="tt-line">  → '+esc(other.label)+' ('+e.weight+')</div>';
+      });
+      tt.innerHTML=html;
+      tt.style.display='block';
+      tt.style.left=(e.clientX-el('tabGraphView').getBoundingClientRect().left+12)+'px';
+      tt.style.top=(e.clientY-el('tabGraphView').getBoundingClientRect().top-10)+'px';
+      graph.style.cursor='pointer';
+    }else{
+      tt.style.display='none';
+      graph.style.cursor='grab';
+    }
+  }
+});
+
+graph.addEventListener('mouseup',function(){
+  if(graphDrag){graphDrag.pinned=false;graphDrag=null;}
+  graphPan=null;
+});
+
+graph.addEventListener('wheel',function(e){
+  e.preventDefault();
+  var factor=e.deltaY<0?1.1:0.9;
+  graphZoom(factor);
+},{passive:false});
+
+function toggleGraphPanel(){el('graphPanel').classList.toggle('open');}
+
+function showNodePanel(node){
+  el('gpTitle').textContent=node.label;
+  var edges=graphEdges.filter(function(e){return e.source===node||e.target===node;});
+  edges.sort(function(a,b){return b.weight-a.weight;});
+  var html='<div class="gp-section">Stats</div>';
+  html+='<div class="gp-row"><span class="gp-k">Messages</span><span class="gp-v">'+node.activity+'</span></div>';
+  html+='<div class="gp-row"><span class="gp-k">Connections</span><span class="gp-v">'+edges.length+'</span></div>';
+  if(edges.length){
+    html+='<div class="gp-section">Top Interactions</div>';
+    edges.slice(0,15).forEach(function(e){
+      var other=e.source===node?e.target:e.source;
+      html+='<div class="gp-edge"><span class="gp-a">'+esc(other.label)+'</span><span class="gp-w">'+e.weight+'</span></div>';
+    });
+  }
+  // find user in dashboard data for extra info
+  if(graphData&&graphData.user_details&&graphData.user_details[node.label]){
+    var ud=graphData.user_details[node.label];
+    html+='<div class="gp-section">Profile</div>';
+    if(ud.first_ts)html+='<div class="gp-row"><span class="gp-k">First seen</span><span class="gp-v">'+esc(ud.first_ts)+'</span></div>';
+    if(ud.last_ts)html+='<div class="gp-row"><span class="gp-k">Last seen</span><span class="gp-v">'+esc(ud.last_ts)+'</span></div>';
+    if(ud.channels)html+='<div class="gp-row"><span class="gp-k">Channels</span><span class="gp-v">'+esc(ud.channels)+'</span></div>';
+  }
+  el('gpBody').innerHTML=html;
+  el('graphPanel').classList.add('open');
+}
 </script>
 </body>
 </html>"""
@@ -6469,6 +6787,34 @@ class WebPortalHandler(BaseHTTPRequestHandler):
             })
         elif parsed.path == "/api/commands":
             self._json_list(PORTAL_COMMANDS)
+        elif parsed.path == "/api/graph":
+            n_str = urllib.parse.parse_qs(parsed.query).get("n", ["15"])[0]
+            try:
+                n = int(n_str)
+            except ValueError:
+                n = 15
+            edges = build_edge_graph(_portal_entries)
+            top_edges = edges.most_common(n)
+            # collect nodes
+            node_counts: Counter = Counter()
+            for (a, b), w in top_edges:
+                node_counts[a] += w
+                node_counts[b] += w
+            nodes = [{"user": u, "count": c} for u, c in node_counts.most_common()]
+            edge_list = [{"source": a, "target": b, "weight": w} for (a, b), w in top_edges]
+            # add user details for panel
+            user_details: dict[str, dict] = {}
+            for u, _ in node_counts.items():
+                user_entries = [e for e in _portal_entries if e.user and e.user.lower() == u.lower()]
+                if user_entries:
+                    ts_list = [e.ts for e in user_entries if e.ts]
+                    channels = Counter(e.target for e in user_entries if e.target)
+                    user_details[u] = {
+                        "first_ts": min(ts_list).isoformat() if ts_list else None,
+                        "last_ts": max(ts_list).isoformat() if ts_list else None,
+                        "channels": ", ".join(ch for ch, _ in channels.most_common(3)),
+                    }
+            self._json_dict({"nodes": nodes, "edges": edge_list, "user_details": user_details})
         else:
             self.send_error(404)
 
