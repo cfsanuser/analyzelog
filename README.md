@@ -1,6 +1,10 @@
 # analyzelog
 A simple but advanced log analyzer.
 
+install llm in 2 commands:
+1. winget install llama.cpp
+2. 2. llama-server -hf ggml-org/gemma-4-E2B-it-GGUF --jinja -c 0 --host 127.0.0.1 --port 8033
+
 analyzelog.py is a multi-format log analysis tool with an interactive shell and web portal. It:
 - 
 Parses JSON Lines, IRC chat, and syslog formats into structured entries
